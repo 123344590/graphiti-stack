@@ -156,6 +156,14 @@ ul.notes li:last-child {{ border-bottom: none; }}
 .login-card form {{ display: flex; flex-direction: column; gap: 14px; }}
 .login-card button {{ margin-top: 4px; }}
 .error {{ color: var(--danger); font-size: 0.88rem; margin: 0; }}
+.tab-btn {{ background: transparent; color: var(--muted); border: 1px solid var(--border); padding: 6px 14px; font-weight: 500; }}
+.tab-btn:hover {{ background: var(--bg); }}
+.tab-btn.active {{ background: var(--accent); color: white; border-color: var(--accent); }}
+.md-preview {{ border: 1px solid var(--border); border-radius: 8px; padding: 16px 20px; min-height: 320px; line-height: 1.6; }}
+.md-preview h1, .md-preview h2, .md-preview h3 {{ margin-top: 0.6em; }}
+.md-preview a {{ color: var(--accent); }}
+.md-preview code {{ background: var(--bg); padding: 2px 5px; border-radius: 4px; font-size: 0.9em; }}
+.md-preview pre {{ background: var(--bg); padding: 12px; border-radius: 8px; overflow-x: auto; }}
 </style></head>
 <body>
 {nav}
@@ -180,7 +188,9 @@ def _login_page(*, error: bool = False) -> str:
 """, authenticated=False)
 
 
-def _agents_page(tokens: dict[str, str], *, created: tuple[str, str] | None = None) -> str:
+def _agents_page(
+    tokens: dict[str, str], *, created: tuple[str, str] | None = None, error: str | None = None,
+) -> str:
     rows = "".join(
         f"<tr><td>{html.escape(group_id)}</td>"
         f"<td><a class=\"link-btn\" href=\"/agents/{quote(group_id)}/graph\">ver grafo</a></td>"
@@ -201,6 +211,8 @@ def _agents_page(tokens: dict[str, str], *, created: tuple[str, str] | None = No
             f"— cópialo ahora, no se volverá a mostrar:</b><br>"
             f"<code style=\"font-size:1.05em\">{html.escape(token)}</code></div>"
         )
+    elif error:
+        banner = f'<div class="banner" style="background:#fef2f2;border-color:#fecaca"><b>{html.escape(error)}</b></div>'
     return _layout(f"""
 <h1>Graphiti — Agentes</h1>
 <p class="muted">Cada agente tiene su propio grafo de memoria y su propio vault de Obsidian, aislados estructuralmente.</p>
@@ -236,6 +248,8 @@ async def _vault_request(method: str, group_id: str, token: str, path: str, **kw
     headers = {"Authorization": f"Bearer {token}"}
     async with aiohttp.ClientSession() as session:
         async with session.request(method, f"{VAULT_SERVICE_BASE}{path}", headers=headers, **kwargs) as resp:
+            if resp.status == 404:
+                raise web.HTTPNotFound(text=await resp.text())
             if resp.status >= 400:
                 raise web.HTTPBadGateway(text=f"vault-service error {resp.status}: {await resp.text()}")
             return await resp.json()
@@ -249,16 +263,46 @@ def _vault_page(group_id: str, notes: list[str], *, open_note: str | None, conte
     editor = ""
     if open_note is not None:
         saved_banner = '<p style="color:var(--ok)">Guardado.</p>' if saved else ""
+        note_id = "note-editor"
         editor = f"""
 <div class="card">
-<h3>{html.escape(open_note)}</h3>
+<div class="row" style="justify-content:space-between">
+  <h3 style="margin:0">{html.escape(open_note)}</h3>
+  <div class="row">
+    <button type="button" class="tab-btn active" data-mode="edit" onclick="setVaultMode('edit')">Editar</button>
+    <button type="button" class="tab-btn" data-mode="preview" onclick="setVaultMode('preview')">Vista previa</button>
+  </div>
+</div>
 {saved_banner}
 <form method="post" action="/agents/{quote(group_id)}/vault/save">
   <input type="hidden" name="note" value="{html.escape(open_note)}">
-  <textarea name="content">{html.escape(content or "")}</textarea><br><br>
+  <textarea id="{note_id}" name="content" oninput="renderVaultPreview()">{html.escape(content or "")}</textarea>
+  <div id="{note_id}-preview" class="md-preview" style="display:none"></div>
+  <br>
   <button type="submit">Guardar</button>
 </form>
-</div>"""
+</div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js"></script>
+<script>
+function vaultNoteHref(name) {{
+  return "/agents/{quote(group_id)}/vault?note=" + encodeURIComponent(name.endsWith(".md") ? name : name + ".md");
+}}
+function renderVaultPreview() {{
+  const src = document.getElementById("{note_id}").value;
+  const withLinks = src.replace(/\\[\\[([^\\]|]+)(\\|[^\\]]+)?\\]\\]/g, (m, target, label) => {{
+    const text = label ? label.slice(1) : target;
+    return "[" + text + "](" + vaultNoteHref(target.trim()) + ")";
+  }});
+  document.getElementById("{note_id}-preview").innerHTML = marked.parse(withLinks);
+}}
+function setVaultMode(mode) {{
+  const isEdit = mode === "edit";
+  document.getElementById("{note_id}").style.display = isEdit ? "block" : "none";
+  document.getElementById("{note_id}-preview").style.display = isEdit ? "none" : "block";
+  document.querySelectorAll(".tab-btn").forEach(b => b.classList.toggle("active", b.dataset.mode === mode));
+  if (!isEdit) renderVaultPreview();
+}}
+</script>"""
     new_note_form = f"""
 <div class="card">
 <h3>Nueva nota</h3>
@@ -313,10 +357,17 @@ async def handle_create(request: web.Request) -> web.Response:
     form = await request.post()
     group_id = str(form.get("group_id", "")).strip()
     if not group_id or not group_id.replace("_", "").replace("-", "").isalnum():
-        raise web.HTTPBadRequest(text="Nombre de agente inválido")
+        tokens = _load()
+        return web.Response(
+            text=_agents_page(tokens, error="Nombre de agente inválido — usa solo letras, números, guiones y guion bajo."),
+            content_type="text/html", status=400,
+        )
     tokens = _load()
     if group_id in tokens.values():
-        raise web.HTTPBadRequest(text=f"El agente '{group_id}' ya existe — revócalo primero si quieres regenerar su token")
+        return web.Response(
+            text=_agents_page(tokens, error=f'El agente "{group_id}" ya existe — revócalo primero si quieres un token nuevo.'),
+            content_type="text/html", status=400,
+        )
     new_token = secrets.token_urlsafe(32)
     tokens[new_token] = group_id
     _save(tokens)
