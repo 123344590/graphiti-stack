@@ -164,6 +164,14 @@ ul.notes li:last-child {{ border-bottom: none; }}
 .md-preview a {{ color: var(--accent); }}
 .md-preview code {{ background: var(--bg); padding: 2px 5px; border-radius: 4px; font-size: 0.9em; }}
 .md-preview pre {{ background: var(--bg); padding: 12px; border-radius: 8px; overflow-x: auto; }}
+ul.vault-explorer li {{ padding: 0; border-bottom: none; }}
+ul.vault-explorer li a {{
+  display: flex; align-items: center; gap: 8px; padding: 8px 20px; text-decoration: none;
+  color: var(--text); font-size: 0.92rem; border-left: 3px solid transparent;
+}}
+ul.vault-explorer li a:hover {{ background: var(--bg); }}
+ul.vault-explorer li.active a {{ background: #eef2ff; border-left-color: var(--accent); font-weight: 600; color: var(--accent); }}
+.note-icon {{ font-size: 0.95em; opacity: 0.7; }}
 </style></head>
 <body>
 {nav}
@@ -235,12 +243,18 @@ def _graph_page(group_id: str) -> str:
     browser_url = f"{FALKORDB_BROWSER_BASE}/?graph={quote(group_id)}"
     return _layout(f"""
 <h1>Grafo de "{html.escape(group_id)}"</h1>
-<p class="muted">FalkorDB Browser, pre-seleccionado en el grafo de este agente.
-Si pide conexión manual, host/puerto son los del propio FalkorDB en este stack
-(ver <code>docs/DEPLOY.md</code>) — el <code>graph</code> en la URL ya fija la base
-de datos a <code>{html.escape(group_id)}</code>, no al grafo compartido
-<code>main</code>.</p>
-<iframe src="{browser_url}"></iframe>
+<div class="card">
+<p class="muted">FalkorDB Browser no permite ser embebido dentro de otra página
+(bloqueo propio del servidor vía <code>X-Frame-Options</code>, no algo que este
+panel pueda desactivar) — se abre en pestaña nueva, pre-seleccionado en el
+grafo de este agente.</p>
+<p><a class="link-btn" href="{browser_url}" target="_blank" rel="noopener">
+Abrir grafo de "{html.escape(group_id)}" en FalkorDB Browser →</a></p>
+<p class="muted">Si ahí pide conexión manual, host/puerto son los del propio
+FalkorDB en este stack (ver <code>docs/DEPLOY.md</code>) — el <code>graph</code>
+en la URL ya fija la base de datos a <code>{html.escape(group_id)}</code>, no al
+grafo compartido <code>main</code>.</p>
+</div>
 """)
 
 
@@ -255,21 +269,29 @@ async def _vault_request(method: str, group_id: str, token: str, path: str, **kw
             return await resp.json()
 
 
+def _note_display_name(filename: str) -> str:
+    return filename[:-3] if filename.endswith(".md") else filename
+
+
 def _vault_page(group_id: str, notes: list[str], *, open_note: str | None, content: str | None, saved: bool) -> str:
     note_items = "".join(
-        f"<li><a class=\"link-btn\" href=\"/agents/{quote(group_id)}/vault?note={quote(n)}\">{html.escape(n)}</a></li>"
+        f"<li class=\"{'active' if n == open_note else ''}\">"
+        f"<a href=\"/agents/{quote(group_id)}/vault?note={quote(n)}\">"
+        f"<span class=\"note-icon\">📄</span>{html.escape(_note_display_name(n))}</a></li>"
         for n in notes
-    ) or '<li class="muted">(sin notas aún)</li>'
+    ) or '<li class="muted" style="padding:8px 12px">(sin notas aún — crea la primera abajo)</li>'
     editor = ""
     if open_note is not None:
+        note_exists = open_note in notes
         saved_banner = '<p style="color:var(--ok)">Guardado.</p>' if saved else ""
         note_id = "note-editor"
+        default_mode = "preview" if (note_exists and content) else "edit"
         editor = f"""
 <div class="card">
 <div class="row" style="justify-content:space-between">
-  <h3 style="margin:0">{html.escape(open_note)}</h3>
+  <h3 style="margin:0">{html.escape(_note_display_name(open_note))}{'' if note_exists else ' <span class="muted" style="font-weight:400">(nota nueva)</span>'}</h3>
   <div class="row">
-    <button type="button" class="tab-btn active" data-mode="edit" onclick="setVaultMode('edit')">Editar</button>
+    <button type="button" class="tab-btn" data-mode="edit" onclick="setVaultMode('edit')">Editar</button>
     <button type="button" class="tab-btn" data-mode="preview" onclick="setVaultMode('preview')">Vista previa</button>
   </div>
 </div>
@@ -302,21 +324,26 @@ function setVaultMode(mode) {{
   document.querySelectorAll(".tab-btn").forEach(b => b.classList.toggle("active", b.dataset.mode === mode));
   if (!isEdit) renderVaultPreview();
 }}
+setVaultMode("{default_mode}");
 </script>"""
-    new_note_form = f"""
-<div class="card">
-<h3>Nueva nota</h3>
-<form method="post" action="/agents/{quote(group_id)}/vault/save">
-  <input type="text" name="note" placeholder="nombre.md" required pattern=".+\\.md"><br><br>
-  <textarea name="content" placeholder="Contenido markdown..."></textarea><br><br>
-  <button type="submit">Crear nota</button>
-</form>
-</div>"""
     return _layout(f"""
 <h1>Vault de "{html.escape(group_id)}"</h1>
 <div class="split">
-  <div><div class="card"><h3>Notas</h3><ul class="notes">{note_items}</ul></div>{new_note_form}</div>
-  <div>{editor}</div>
+  <div>
+    <div class="card" style="padding:12px 0">
+      <h3 style="padding:0 20px">Notas</h3>
+      <ul class="notes vault-explorer">{note_items}</ul>
+    </div>
+    <div class="card">
+      <h3>Nueva nota</h3>
+      <form method="post" action="/agents/{quote(group_id)}/vault/save">
+        <input type="text" name="note" placeholder="nombre.md" required pattern=".+\\.md"><br><br>
+        <textarea name="content" placeholder="Contenido markdown..."></textarea><br><br>
+        <button type="submit">Crear nota</button>
+      </form>
+    </div>
+  </div>
+  <div>{editor or '<div class="card muted">Selecciona una nota de la izquierda, o crea una nueva.</div>'}</div>
 </div>
 """)
 
