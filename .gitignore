@@ -1,0 +1,7 @@
+.env
+repo/
+data/vaults/*
+!data/vaults/.gitkeep
+__pycache__/
+*.pyc
+.DS_Store

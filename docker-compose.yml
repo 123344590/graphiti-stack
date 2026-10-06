@@ -1,0 +1,92 @@
+services:
+  falkordb:
+    # Pinned to v4.x: graphiti-core's Cypher calls db.idx.fulltext.createNodeIndex
+    # with 5 positional args, which v6's FalkorDB module signature rejects
+    # ("expected at most 1"). Do not bump to :latest without re-checking that
+    # upstream graphiti-core has migrated its index-creation calls for v6.
+    image: falkordb/falkordb:v4.22.0
+    restart: unless-stopped
+    ports:
+      - "${FALKORDB_BROWSER_PORT:-3000}:3000"
+    volumes:
+      - falkordb_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  graphiti-mcp:
+    build:
+      context: ./repo/mcp_server
+      args:
+        # Upstream Dockerfile pins 0.29.1, which predates the
+        # OpenAIGenericClient(structured_output_mode=...) kwarg that main's
+        # mcp_server code already calls. 0.30.2 is the first graphiti-core
+        # release compatible with both.
+        GRAPHITI_CORE_VERSION: "0.30.2"
+    restart: unless-stopped
+    depends_on:
+      falkordb:
+        condition: service_healthy
+    environment:
+      - FALKORDB_HOST=falkordb
+      - FALKORDB_PORT=6379
+      - OPENAI_API_KEY=${LLM_API_KEY}
+      - OPENAI_BASE_URL=${LLM_BASE_URL}
+      - MODEL_NAME=${LLM_MODEL}
+      - EMBEDDER_MODEL_NAME=${EMBEDDING_MODEL}
+      # Default/fallback group when a request somehow reaches this server
+      # without the proxy in front (should not happen in normal operation —
+      # the proxy is the only port this compose file exposes publicly).
+      - GROUP_ID=main
+    expose:
+      - "8000"
+
+  auth-proxy:
+    build: ./services/proxy
+    restart: unless-stopped
+    depends_on:
+      - graphiti-mcp
+    environment:
+      - UPSTREAM=http://graphiti-mcp:8000
+      - AGENT_TOKENS_PATH=/data/agent_tokens.json
+      - PROXY_PORT=8080
+    volumes:
+      - agent_tokens:/data
+    ports:
+      - "${PROXY_PORT:-8080}:8080"
+
+  vault-service:
+    build: ./services/vault
+    restart: unless-stopped
+    environment:
+      - VAULTS_ROOT=/data/vaults
+      - AGENT_TOKENS_PATH=/data/tokens/agent_tokens.json
+      - VAULT_PORT=8070
+    volumes:
+      - agent_tokens:/data/tokens:ro
+      - ./data/vaults:/data/vaults
+    expose:
+      - "8070"
+
+  admin:
+    build: ./services/admin
+    restart: unless-stopped
+    depends_on:
+      - auth-proxy
+      - vault-service
+    environment:
+      - ADMIN_USER=${ADMIN_USER}
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD}
+      - AGENT_TOKENS_PATH=/data/agent_tokens.json
+      - FALKORDB_BROWSER_BASE=http://${PUBLIC_HOST}:${FALKORDB_BROWSER_PORT:-3000}
+      - VAULT_SERVICE_BASE=http://vault-service:8070
+    volumes:
+      - agent_tokens:/data
+    ports:
+      - "${ADMIN_PORT:-8090}:8090"
+
+volumes:
+  falkordb_data:
+  agent_tokens:
