@@ -8,9 +8,13 @@ that agent's own graph key so operators never land on the shared default graph
 by accident), and browse/edit each agent's Obsidian vault (list notes, read,
 edit, save) via the vault service's HTTP API.
 
-Single operator account (HTTP Basic) — infrastructure administration, not a
-multi-tenant app, same pattern Hermes's own dashboard uses for a non-loopback
-bind.
+Single operator account, authenticated through an actual login page (not the
+browser's native HTTP-Basic prompt) — a signed, httpOnly session cookie backs
+it: the login form posts credentials once, the server issues a signed token
+(username + expiry + HMAC over both, keyed by a per-process random secret) and
+every later request is authenticated by verifying that signature, never by
+re-sending the password. Infrastructure administration for one operator, not a
+multi-tenant app — this is deliberately simpler than a real user/session store.
 
 Writes directly to the same agent_tokens.json the auth-proxy and vault service
 both read. Every one of those three processes re-reads the file per request
@@ -18,21 +22,58 @@ both read. Every one of those three processes re-reads the file per request
 token created/revoked here takes effect everywhere on the very next request —
 no restart, no signal, no coordination beyond the shared bind-mounted file.
 """
+import hashlib
+import hmac
 import html
 import json
 import os
 import secrets
+import time
 from pathlib import Path
 from urllib.parse import quote
 
 import aiohttp
-from aiohttp import web, BasicAuth
+from aiohttp import web
 
 TOKENS_PATH = Path(os.environ.get("AGENT_TOKENS_PATH", "/data/agent_tokens.json"))
 ADMIN_USER = os.environ["ADMIN_USER"]
 ADMIN_PASSWORD = os.environ["ADMIN_PASSWORD"]
 FALKORDB_BROWSER_BASE = os.environ.get("FALKORDB_BROWSER_BASE", "http://10.147.200.5:3000")
 VAULT_SERVICE_BASE = os.environ.get("VAULT_SERVICE_BASE", "http://vault-service:8070")
+
+# Generated fresh on every process start -- every existing session cookie is
+# invalidated on a restart/redeploy, which is the simplest correct behavior
+# for a single-operator panel with no persistent session store to manage.
+_SESSION_SECRET = secrets.token_bytes(32)
+_SESSION_COOKIE = "graphiti_admin_session"
+_SESSION_TTL_SECONDS = 7 * 24 * 3600
+
+
+def _sign(payload: str) -> str:
+    return hmac.new(_SESSION_SECRET, payload.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def _make_session_cookie() -> str:
+    expires_at = int(time.time()) + _SESSION_TTL_SECONDS
+    payload = f"{ADMIN_USER}:{expires_at}"
+    return f"{payload}:{_sign(payload)}"
+
+
+def _session_is_valid(cookie_value: str | None) -> bool:
+    if not cookie_value or cookie_value.count(":") != 2:
+        return False
+    user, expires_at, signature = cookie_value.split(":")
+    payload = f"{user}:{expires_at}"
+    if not hmac.compare_digest(signature, _sign(payload)):
+        return False
+    if not expires_at.isdigit() or int(expires_at) < time.time():
+        return False
+    return hmac.compare_digest(user, ADMIN_USER)
+
+
+def _require_auth(request: web.Request) -> None:
+    if not _session_is_valid(request.cookies.get(_SESSION_COOKIE)):
+        raise web.HTTPFound("/login")
 
 
 def _load() -> dict[str, str]:
@@ -56,80 +97,133 @@ def _token_for(group_id: str, tokens: dict[str, str]) -> str | None:
     return None
 
 
-def _require_auth(request: web.Request) -> None:
-    hdr = request.headers.get("Authorization", "")
-    try:
-        auth = BasicAuth.decode(hdr)
-    except ValueError:
-        raise web.HTTPUnauthorized(headers={"WWW-Authenticate": 'Basic realm="graphiti-admin"'})
-    if not (secrets.compare_digest(auth.login, ADMIN_USER)
-            and secrets.compare_digest(auth.password, ADMIN_PASSWORD)):
-        raise web.HTTPUnauthorized(headers={"WWW-Authenticate": 'Basic realm="graphiti-admin"'})
-
-
-def _layout(body: str) -> str:
+def _layout(body: str, *, authenticated: bool = True) -> str:
+    nav = '<div class="nav"><a href="/">Agentes</a><a href="/logout">Cerrar sesión</a></div>' if authenticated else ""
     return f"""<!DOCTYPE html>
 <html><head><title>Graphiti Admin</title>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
-body {{ font-family: system-ui, sans-serif; max-width: 960px; margin: 40px auto; padding: 0 16px; color: #1a1a1a; }}
-table {{ width: 100%; border-collapse: collapse; margin-top: 16px; }}
-td, th {{ border-bottom: 1px solid #ddd; padding: 8px; text-align: left; vertical-align: top; }}
-input[type=text], textarea {{ padding: 6px; font-family: inherit; }}
-input[type=text] {{ width: 240px; }}
-textarea {{ width: 100%; min-height: 320px; font-family: ui-monospace, monospace; font-size: 0.9em; }}
-button {{ padding: 6px 12px; cursor: pointer; }}
-a {{ color: #2563eb; }}
-.nav {{ margin-bottom: 24px; }}
-.nav a {{ margin-right: 16px; }}
-.banner {{ background:#fffae0; border:1px solid #d9b500; padding:12px; margin-bottom:16px; }}
-iframe {{ width: 100%; height: 640px; border: 1px solid #ddd; margin-top: 12px; }}
-ul.notes {{ list-style: none; padding: 0; }}
-ul.notes li {{ padding: 4px 0; border-bottom: 1px solid #eee; }}
+:root {{
+  --bg: #f7f8fa; --surface: #ffffff; --border: #e2e5ea; --text: #1a1d23; --muted: #6b7280;
+  --accent: #4f46e5; --accent-hover: #4338ca; --danger: #dc2626; --ok: #15803d;
+}}
+* {{ box-sizing: border-box; }}
+body {{
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  max-width: 980px; margin: 0 auto; padding: 32px 20px 64px; background: var(--bg); color: var(--text);
+}}
+h1 {{ font-size: 1.5rem; margin: 0 0 4px; }}
+h2, h3 {{ color: var(--text); }}
+.nav {{ display: flex; justify-content: space-between; align-items: center; margin-bottom: 28px; padding-bottom: 16px; border-bottom: 1px solid var(--border); }}
+.nav a {{ color: var(--accent); text-decoration: none; font-weight: 500; }}
+.nav a:hover {{ text-decoration: underline; }}
+.card {{ background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 24px; box-shadow: 0 1px 2px rgba(16,24,40,0.04); }}
+.card + .card {{ margin-top: 20px; }}
+table {{ width: 100%; border-collapse: collapse; margin-top: 8px; }}
+td, th {{ border-bottom: 1px solid var(--border); padding: 10px 8px; text-align: left; vertical-align: middle; font-size: 0.92rem; }}
+th {{ color: var(--muted); font-weight: 600; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.03em; }}
+tr:last-child td {{ border-bottom: none; }}
+input[type=text], input[type=password], textarea {{
+  padding: 10px 12px; font-family: inherit; font-size: 0.95rem; border: 1px solid var(--border);
+  border-radius: 8px; background: var(--surface); color: var(--text); outline: none;
+}}
+input[type=text]:focus, input[type=password]:focus, textarea:focus {{ border-color: var(--accent); box-shadow: 0 0 0 3px rgba(79,70,229,0.12); }}
+input[type=text] {{ width: 260px; }}
+textarea {{ width: 100%; min-height: 320px; font-family: ui-monospace, "SF Mono", monospace; font-size: 0.88rem; }}
+button {{
+  padding: 10px 18px; cursor: pointer; border: none; border-radius: 8px; background: var(--accent);
+  color: white; font-weight: 600; font-size: 0.9rem; transition: background 0.15s;
+}}
+button:hover {{ background: var(--accent-hover); }}
+button.danger {{ background: transparent; color: var(--danger); border: 1px solid #fecaca; }}
+button.danger:hover {{ background: #fef2f2; }}
+a.link-btn {{ color: var(--accent); text-decoration: none; font-weight: 500; font-size: 0.9rem; }}
+a.link-btn:hover {{ text-decoration: underline; }}
+.banner {{ background: #fffbeb; border: 1px solid #fde68a; border-radius: 8px; padding: 14px 16px; margin-bottom: 20px; }}
+iframe {{ width: 100%; height: 640px; border: 1px solid var(--border); border-radius: 8px; margin-top: 12px; }}
+ul.notes {{ list-style: none; padding: 0; margin: 0; }}
+ul.notes li {{ padding: 8px 0; border-bottom: 1px solid var(--border); }}
+ul.notes li:last-child {{ border-bottom: none; }}
+.muted {{ color: var(--muted); font-size: 0.88rem; }}
+.row {{ display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }}
+.split {{ display: flex; gap: 24px; align-items: flex-start; }}
+.split > div:first-child {{ flex: 1; min-width: 220px; }}
+.split > div:last-child {{ flex: 2; min-width: 300px; }}
+.login-wrap {{ display: flex; align-items: center; justify-content: center; min-height: 80vh; }}
+.login-card {{ width: 100%; max-width: 360px; }}
+.login-card h1 {{ text-align: center; margin-bottom: 24px; }}
+.login-card form {{ display: flex; flex-direction: column; gap: 14px; }}
+.login-card button {{ margin-top: 4px; }}
+.error {{ color: var(--danger); font-size: 0.88rem; margin: 0; }}
 </style></head>
 <body>
-<div class="nav"><a href="/">Agentes</a></div>
+{nav}
 {body}
 </body></html>"""
+
+
+def _login_page(*, error: bool = False) -> str:
+    error_html = '<p class="error">Usuario o contraseña incorrectos.</p>' if error else ""
+    return _layout(f"""
+<div class="login-wrap">
+  <div class="login-card card">
+    <h1>Graphiti Admin</h1>
+    {error_html}
+    <form method="post" action="/login">
+      <input type="text" name="username" placeholder="Usuario" autocomplete="username" required autofocus>
+      <input type="password" name="password" placeholder="Contraseña" autocomplete="current-password" required>
+      <button type="submit">Entrar</button>
+    </form>
+  </div>
+</div>
+""", authenticated=False)
 
 
 def _agents_page(tokens: dict[str, str], *, created: tuple[str, str] | None = None) -> str:
     rows = "".join(
         f"<tr><td>{html.escape(group_id)}</td>"
-        f"<td><a href=\"/agents/{quote(group_id)}/graph\">ver grafo</a></td>"
-        f"<td><a href=\"/agents/{quote(group_id)}/vault\">ver vault</a></td>"
+        f"<td><a class=\"link-btn\" href=\"/agents/{quote(group_id)}/graph\">ver grafo</a></td>"
+        f"<td><a class=\"link-btn\" href=\"/agents/{quote(group_id)}/vault\">ver vault</a></td>"
         f"<td><form method=\"post\" action=\"/delete\" style=\"display:inline\">"
         f"<input type=\"hidden\" name=\"group_id\" value=\"{html.escape(group_id)}\">"
-        f"<button type=\"submit\" onclick=\"return confirm('Revocar el token de {html.escape(group_id)}?')\">revocar</button>"
+        f"<button type=\"submit\" class=\"danger\" onclick=\"return confirm('Revocar el token de {html.escape(group_id)}?')\">revocar</button>"
         f"</form></td></tr>"
         for group_id in sorted(tokens.values())
     )
+    if not rows:
+        rows = '<tr><td colspan="4" class="muted">Sin agentes todavía — crea el primero arriba.</td></tr>'
     banner = ""
     if created:
         group_id, token = created
         banner = (
             f"<div class=\"banner\"><b>Token para \"{html.escape(group_id)}\" "
             f"— cópialo ahora, no se volverá a mostrar:</b><br>"
-            f"<code style=\"font-size:1.1em\">{html.escape(token)}</code></div>"
+            f"<code style=\"font-size:1.05em\">{html.escape(token)}</code></div>"
         )
     return _layout(f"""
 <h1>Graphiti — Agentes</h1>
+<p class="muted">Cada agente tiene su propio grafo de memoria y su propio vault de Obsidian, aislados estructuralmente.</p>
 {banner}
-<form method="post" action="/create">
-  <input type="text" name="group_id" placeholder="nombre del agente (ej. miguel)" required pattern="[a-zA-Z0-9_-]+">
-  <button type="submit">Crear agente + token</button>
-</form>
-<table>
-<thead><tr><th>Agente (group_id)</th><th>Grafo</th><th>Vault</th><th></th></tr></thead>
-<tbody>{rows}</tbody>
-</table>""")
+<div class="card">
+  <form method="post" action="/create" class="row">
+    <input type="text" name="group_id" placeholder="nombre del agente (ej. miguel)" required pattern="[a-zA-Z0-9_-]+">
+    <button type="submit">Crear agente + token</button>
+  </form>
+</div>
+<div class="card">
+  <table>
+  <thead><tr><th>Agente</th><th>Grafo</th><th>Vault</th><th></th></tr></thead>
+  <tbody>{rows}</tbody>
+  </table>
+</div>""")
 
 
 def _graph_page(group_id: str) -> str:
     browser_url = f"{FALKORDB_BROWSER_BASE}/?graph={quote(group_id)}"
     return _layout(f"""
 <h1>Grafo de "{html.escape(group_id)}"</h1>
-<p>FalkorDB Browser, pre-seleccionado en el grafo de este agente.
+<p class="muted">FalkorDB Browser, pre-seleccionado en el grafo de este agente.
 Si pide conexión manual, host/puerto son los del propio FalkorDB en este stack
 (ver <code>docs/DEPLOY.md</code>) — el <code>graph</code> en la URL ya fija la base
 de datos a <code>{html.escape(group_id)}</code>, no al grafo compartido
@@ -149,34 +243,64 @@ async def _vault_request(method: str, group_id: str, token: str, path: str, **kw
 
 def _vault_page(group_id: str, notes: list[str], *, open_note: str | None, content: str | None, saved: bool) -> str:
     note_items = "".join(
-        f"<li><a href=\"/agents/{quote(group_id)}/vault?note={quote(n)}\">{html.escape(n)}</a></li>"
+        f"<li><a class=\"link-btn\" href=\"/agents/{quote(group_id)}/vault?note={quote(n)}\">{html.escape(n)}</a></li>"
         for n in notes
-    ) or "<li><em>(sin notas aún)</em></li>"
+    ) or '<li class="muted">(sin notas aún)</li>'
     editor = ""
     if open_note is not None:
-        saved_banner = '<p style="color:#15803d">Guardado.</p>' if saved else ""
+        saved_banner = '<p style="color:var(--ok)">Guardado.</p>' if saved else ""
         editor = f"""
-<h2>{html.escape(open_note)}</h2>
+<div class="card">
+<h3>{html.escape(open_note)}</h3>
 {saved_banner}
 <form method="post" action="/agents/{quote(group_id)}/vault/save">
   <input type="hidden" name="note" value="{html.escape(open_note)}">
-  <textarea name="content">{html.escape(content or "")}</textarea><br>
+  <textarea name="content">{html.escape(content or "")}</textarea><br><br>
   <button type="submit">Guardar</button>
-</form>"""
+</form>
+</div>"""
     new_note_form = f"""
+<div class="card">
 <h3>Nueva nota</h3>
 <form method="post" action="/agents/{quote(group_id)}/vault/save">
-  <input type="text" name="note" placeholder="nombre.md" required pattern=".+\\.md">
-  <textarea name="content" placeholder="Contenido markdown..."></textarea><br>
+  <input type="text" name="note" placeholder="nombre.md" required pattern=".+\\.md"><br><br>
+  <textarea name="content" placeholder="Contenido markdown..."></textarea><br><br>
   <button type="submit">Crear nota</button>
-</form>"""
+</form>
+</div>"""
     return _layout(f"""
 <h1>Vault de "{html.escape(group_id)}"</h1>
-<div style="display:flex; gap:32px;">
-  <div style="flex:1"><h3>Notas</h3><ul class="notes">{note_items}</ul>{new_note_form}</div>
-  <div style="flex:2">{editor}</div>
+<div class="split">
+  <div><div class="card"><h3>Notas</h3><ul class="notes">{note_items}</ul></div>{new_note_form}</div>
+  <div>{editor}</div>
 </div>
 """)
+
+
+async def handle_login_page(request: web.Request) -> web.Response:
+    if _session_is_valid(request.cookies.get(_SESSION_COOKIE)):
+        raise web.HTTPFound("/")
+    return web.Response(text=_login_page(), content_type="text/html")
+
+
+async def handle_login_submit(request: web.Request) -> web.Response:
+    form = await request.post()
+    username = str(form.get("username", ""))
+    password = str(form.get("password", ""))
+    if not (secrets.compare_digest(username, ADMIN_USER) and secrets.compare_digest(password, ADMIN_PASSWORD)):
+        return web.Response(text=_login_page(error=True), content_type="text/html", status=401)
+    response = web.HTTPFound("/")
+    response.set_cookie(
+        _SESSION_COOKIE, _make_session_cookie(),
+        max_age=_SESSION_TTL_SECONDS, httponly=True, samesite="Strict",
+    )
+    raise response
+
+
+async def handle_logout(request: web.Request) -> web.Response:
+    response = web.HTTPFound("/login")
+    response.del_cookie(_SESSION_COOKIE)
+    raise response
 
 
 async def handle_index(request: web.Request) -> web.Response:
@@ -258,6 +382,9 @@ async def handle_vault_save(request: web.Request) -> web.Response:
 
 def build_app() -> web.Application:
     app = web.Application()
+    app.router.add_get("/login", handle_login_page)
+    app.router.add_post("/login", handle_login_submit)
+    app.router.add_get("/logout", handle_logout)
     app.router.add_get("/", handle_index)
     app.router.add_post("/create", handle_create)
     app.router.add_post("/delete", handle_delete)
