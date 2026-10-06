@@ -3,9 +3,10 @@
 
 One page to: create/revoke per-agent tokens (shared by the Graphiti auth-proxy
 and the vault service — same token, same group_id, one identity per agent),
-view each agent's knowledge graph (embedded FalkorDB Browser iframe, scoped to
-that agent's own graph key so operators never land on the shared default graph
-by accident), and browse/edit each agent's Obsidian vault (list notes, read,
+open each agent's knowledge graph (FalkorDB Browser, in a new tab and
+pre-scoped to that agent's own graph key so operators never land on the
+shared default graph by accident — it can't be embedded in an iframe, see
+_graph_page), and browse/edit each agent's Obsidian vault (list notes, read,
 edit, save) via the vault service's HTTP API.
 
 Single operator account, authenticated through an actual login page (not the
@@ -141,7 +142,6 @@ button.danger:hover {{ background: #fef2f2; }}
 a.link-btn {{ color: var(--accent); text-decoration: none; font-weight: 500; font-size: 0.9rem; }}
 a.link-btn:hover {{ text-decoration: underline; }}
 .banner {{ background: #fffbeb; border: 1px solid #fde68a; border-radius: 8px; padding: 14px 16px; margin-bottom: 20px; }}
-iframe {{ width: 100%; height: 640px; border: 1px solid var(--border); border-radius: 8px; margin-top: 12px; }}
 ul.notes {{ list-style: none; padding: 0; margin: 0; }}
 ul.notes li {{ padding: 8px 0; border-bottom: 1px solid var(--border); }}
 ul.notes li:last-child {{ border-bottom: none; }}
