@@ -18,7 +18,14 @@ services:
 
   graphiti-mcp:
     build:
+      # mcp_server/docker/Dockerfile.standalone -- the MCP server alone,
+      # talking to an EXTERNAL FalkorDB (ours, pinned below). The *other*
+      # Dockerfile in that directory bundles its own embedded FalkorDB
+      # :latest image, which is both redundant with our pinned falkordb
+      # service and would silently reintroduce the v6 index-procedure
+      # incompatibility this pin exists to avoid.
       context: ./repo/mcp_server
+      dockerfile: docker/Dockerfile.standalone
       args:
         # Upstream Dockerfile pins 0.29.1, which predates the
         # OpenAIGenericClient(structured_output_mode=...) kwarg that main's
@@ -30,16 +37,19 @@ services:
       falkordb:
         condition: service_healthy
     environment:
-      - FALKORDB_HOST=falkordb
-      - FALKORDB_PORT=6379
+      # Names here match config/config.yaml's ${VAR:default} expansions in
+      # the upstream repo exactly -- see docs/ARCHITECTURE.md for why this
+      # matters (the previous names, e.g. FALKORDB_HOST/OPENAI_BASE_URL,
+      # aren't read by that file at all and silently fall back to defaults).
+      - FALKORDB_URI=redis://falkordb:6379
       - OPENAI_API_KEY=${LLM_API_KEY}
-      - OPENAI_BASE_URL=${LLM_BASE_URL}
+      - OPENAI_API_URL=${LLM_BASE_URL}
       - MODEL_NAME=${LLM_MODEL}
-      - EMBEDDER_MODEL_NAME=${EMBEDDING_MODEL}
+      - EMBEDDER_MODEL=${EMBEDDING_MODEL}
       # Default/fallback group when a request somehow reaches this server
       # without the proxy in front (should not happen in normal operation —
       # the proxy is the only port this compose file exposes publicly).
-      - GROUP_ID=main
+      - GRAPHITI_GROUP_ID=main
     expose:
       - "8000"
 
