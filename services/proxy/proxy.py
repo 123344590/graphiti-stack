@@ -24,6 +24,15 @@ This proxy closes that gap structurally, not by prompt instruction:
   - Streams the response body (SSE / chunked) rather than buffering it whole --
     required for MCP's streamable-HTTP transport, which keeps the connection
     open; buffer-then-reply breaks it ("SSE stream ended without a response").
+
+URL shape: an agent's MCP endpoint is /mcp/<group_id>/ -- the path names
+which agent this is FOR CONFIGURATION CLARITY, but it is never trusted on
+its own. The Bearer token is still required and must resolve (via
+agent_tokens.json) to that SAME group_id, or the request is rejected before
+it ever reaches Graphiti -- the URL documents intent, the token is what
+actually authorizes it. The bare /mcp/ path (no agent name) still works
+exactly as before, resolving group_id from the token alone, for any caller
+not yet updated to the per-agent URL.
 """
 import json
 import logging
@@ -105,11 +114,31 @@ def _enforce_group_id(body: bytes, group_id: str) -> tuple[bytes, bool]:
 async def handle(request: web.Request) -> web.StreamResponse:
     auth = request.headers.get("Authorization", "")
     token = auth.removeprefix("Bearer ").strip() if auth.startswith("Bearer ") else ""
-    group_id = _load_tokens().get(token)
-    if not group_id:
+    token_group_id = _load_tokens().get(token)
+    if not token_group_id:
         return web.json_response({"error": "unauthorized"}, status=401)
 
-    url = f"{UPSTREAM}{request.path_qs}"
+    # /mcp/<url_group_id>/<rest> -- present only on the per-agent URL form,
+    # e.g. /mcp/miguel/ itself (rest="") or /mcp/miguel/some/sub/path. The
+    # token's own group_id is the sole source of truth; a URL naming a
+    # DIFFERENT agent than the token belongs to is rejected outright rather
+    # than silently using either one, so a stale/copy-pasted URL can never
+    # quietly operate on the wrong agent's memory. Upstream (Graphiti itself)
+    # knows nothing about per-agent paths, so the agent-name segment is
+    # stripped and "mcp/" is restored in its place before forwarding --
+    # /mcp/miguel/ becomes upstream /mcp/, /mcp/miguel/foo becomes /mcp/foo.
+    url_group_id = request.match_info.get("group_id")
+    if url_group_id is not None:
+        if url_group_id != token_group_id:
+            return web.json_response({"error": "token does not match the agent in this URL"}, status=403)
+        rest = request.match_info["rest"]
+        upstream_path = f"mcp/{rest}" if rest else "mcp/"
+    else:
+        upstream_path = request.match_info["upstream_path"]
+    group_id = token_group_id
+
+    query = f"?{request.query_string}" if request.query_string else ""
+    url = f"{UPSTREAM}/{upstream_path}{query}"
     fwd_headers = {k: v for k, v in request.headers.items() if k.lower() not in _HOP_BY_HOP}
     raw_body = await request.read()
     body, rewrote = _enforce_group_id(raw_body, group_id) if raw_body else (raw_body, False)
@@ -137,7 +166,11 @@ async def handle_health(request: web.Request) -> web.Response:
 def build_app() -> web.Application:
     app = web.Application()
     app.router.add_get("/proxy-health", handle_health)
-    app.router.add_route("*", "/{path:.*}", handle)
+    # Per-agent URL form first (more specific) -- aiohttp matches routes in
+    # registration order, so this must come before the bare catch-all or it
+    # would never be reached.
+    app.router.add_route("*", "/mcp/{group_id}/{rest:.*}", handle)
+    app.router.add_route("*", "/{upstream_path:.*}", handle)
     return app
 
 

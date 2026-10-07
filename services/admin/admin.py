@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """Admin panel for the graphiti-stack deployment.
 
-One integrated, logged-in app: an agent switcher in the nav (same pattern as
-switching profiles in the sibling hermes-agent dashboard) jumps between
-agents while staying on the same section -- Grafo or Vault -- so picking a
-different agent never bounces back to a separate list page. `/agents/new`
-is the one place that creates or revokes agent tokens; everything else
-(`/agents/{group_id}/graph`, `/agents/{group_id}/vault`) is scoped to one
-agent at a time and requires that agent to already exist.
+One integrated, logged-in app with a fixed left sidebar (same shape as the
+sibling hermes-agent dashboard): an agent picker at the top of the sidebar,
+Grafo/Vault/Agentes as nav items below it. Picking an agent once scopes
+BOTH Grafo and Vault to that agent -- there is no separate per-section
+agent picker to keep in sync, and switching agents never bounces back to a
+separate list page. `/agents/new` ("Agentes" in the sidebar) is the one
+place that creates or revokes agent tokens; `/agents/{group_id}/graph` and
+`/agents/{group_id}/vault` are scoped to one agent at a time and require
+that agent to already exist.
 
 The graph view queries FalkorDB directly over the internal docker network
 and renders in-page with vis-network -- not a link out to FalkorDB's own
@@ -163,25 +165,56 @@ def _token_for(group_id: str, tokens: dict[str, str]) -> str | None:
 def _agent_switcher(all_agents: list[str], current: str | None, view: str) -> str:
     """Dropdown that jumps straight to <selected agent>/<same view> -- changing
     the agent re-renders the same section (graph stays on graph, vault stays
-    on vault) instead of bouncing back to a separate agent list."""
-    if not all_agents:
-        return ""
+    on vault) instead of bouncing back to a separate agent list. Lives in the
+    sidebar header, above the Grafo/Vault nav items, so picking an agent once
+    scopes everything below it -- there's no separate per-section agent
+    picker to keep in sync."""
     options = "".join(
         f'<option value="{quote(a)}" {"selected" if a == current else ""}>{html.escape(a)}</option>'
         for a in all_agents
     )
-    return f"""<select class="agent-switcher" onchange="location.href='/agents/' + this.value + '/{view}'">
-  <option value="" disabled {"selected" if current is None else ""}>Agente…</option>
+    placeholder = '<option value="" disabled selected>Sin agentes</option>' if not all_agents else ""
+    return f"""<select class="agent-switcher" onchange="location.href='/agents/' + this.value + '/{view}'" {"disabled" if not all_agents else ""}>
+  {placeholder}
+  <option value="" disabled {"selected" if (current is None and all_agents) else ""} hidden>Elegir agente…</option>
   {options}
 </select>"""
 
 
-def _layout(body: str, *, authenticated: bool = True, nav_extra: str = "") -> str:
-    nav = (
-        f'<div class="nav"><div class="row">'
-        f'<a href="/agents/new">+ Crear agente</a>{nav_extra}'
-        f'</div><a href="/logout">Cerrar sesión</a></div>'
-    ) if authenticated else ""
+def _sidebar(all_agents: list[str], current: str | None, view: str) -> str:
+    """Fixed left sidebar: agent picker on top, Grafo/Vault/Agentes below it.
+    Grafo and Vault links always target the CURRENTLY selected agent (or the
+    first agent, if none is selected yet) -- selecting an agent once is
+    enough to scope both sections, matching the explicit ask that choosing
+    an agent should carry its graph AND its vault together rather than
+    managing them as separate, independently-navigated things."""
+    target = current or (all_agents[0] if all_agents else None)
+    nav_items = [("graph", "🕸️", "Grafo"), ("vault", "📝", "Vault")]
+    links = "".join(
+        f'<a href="/agents/{quote(target)}/{slug}" class="side-link {"active" if slug == view else ""}">'
+        f'<span class="side-icon">{icon}</span>{label}</a>'
+        for slug, icon, label in nav_items
+    ) if target else '<p class="muted" style="padding:0 20px">Crea un agente para empezar.</p>'
+    return f"""<div class="sidebar">
+  <div class="sidebar-brand">Graphiti</div>
+  <div class="sidebar-agent">
+    {_agent_switcher(all_agents, current, view)}
+  </div>
+  <nav class="side-nav">
+    {links}
+    <a href="/agents/new" class="side-link {"active" if view == "manage" else ""}">
+      <span class="side-icon">👥</span>Agentes</a>
+  </nav>
+  <div class="sidebar-footer"><a href="/logout">Cerrar sesión</a></div>
+</div>"""
+
+
+def _layout(
+    body: str, *, authenticated: bool = True, all_agents: list[str] | None = None,
+    current_agent: str | None = None, view: str = "manage",
+) -> str:
+    sidebar = _sidebar(all_agents or [], current_agent, view) if authenticated else ""
+    body_class = "with-sidebar" if authenticated else ""
     return f"""<!DOCTYPE html>
 <html><head><title>Graphiti Admin</title>
 <meta charset="utf-8">
@@ -192,15 +225,34 @@ def _layout(body: str, *, authenticated: bool = True, nav_extra: str = "") -> st
   --accent: #4f46e5; --accent-hover: #4338ca; --danger: #dc2626; --ok: #15803d;
 }}
 * {{ box-sizing: border-box; }}
+html, body {{ height: 100%; }}
 body {{
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
-  max-width: 980px; margin: 0 auto; padding: 32px 20px 64px; background: var(--bg); color: var(--text);
+  margin: 0; background: var(--bg); color: var(--text);
 }}
+body.with-sidebar {{ display: flex; min-height: 100vh; }}
 h1 {{ font-size: 1.5rem; margin: 0 0 4px; }}
 h2, h3 {{ color: var(--text); }}
-.nav {{ display: flex; justify-content: space-between; align-items: center; margin-bottom: 28px; padding-bottom: 16px; border-bottom: 1px solid var(--border); }}
-.nav a {{ color: var(--accent); text-decoration: none; font-weight: 500; }}
-.nav a:hover {{ text-decoration: underline; }}
+.sidebar {{
+  width: 220px; flex-shrink: 0; background: var(--surface); border-right: 1px solid var(--border);
+  display: flex; flex-direction: column; min-height: 100vh; position: sticky; top: 0;
+}}
+.sidebar-brand {{ font-weight: 700; font-size: 1.1rem; padding: 20px 20px 16px; border-bottom: 1px solid var(--border); }}
+.sidebar-agent {{ padding: 16px 20px; border-bottom: 1px solid var(--border); }}
+.sidebar-agent select {{ width: 100%; }}
+.side-nav {{ display: flex; flex-direction: column; padding: 12px; gap: 2px; flex: 1; }}
+.side-link {{
+  display: flex; align-items: center; gap: 10px; padding: 10px 12px; border-radius: 8px;
+  text-decoration: none; color: var(--text); font-weight: 500; font-size: 0.92rem;
+}}
+.side-link:hover {{ background: var(--bg); }}
+.side-link.active {{ background: #eef2ff; color: var(--accent); font-weight: 600; }}
+.side-icon {{ font-size: 1.05em; width: 1.3em; text-align: center; }}
+.sidebar-footer {{ padding: 16px 20px; border-top: 1px solid var(--border); }}
+.sidebar-footer a {{ color: var(--muted); text-decoration: none; font-size: 0.88rem; }}
+.sidebar-footer a:hover {{ color: var(--text); }}
+.main-content {{ flex: 1; min-width: 0; padding: 32px 36px 64px; max-width: 1100px; }}
+.login-page-body {{ min-height: 100vh; }}
 .card {{ background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 24px; box-shadow: 0 1px 2px rgba(16,24,40,0.04); }}
 .card + .card {{ margin-top: 20px; }}
 table {{ width: 100%; border-collapse: collapse; margin-top: 8px; }}
@@ -258,18 +310,13 @@ ul.vault-explorer li.active a {{ background: #eef2ff; border-left-color: var(--a
   padding: 8px 12px; border-radius: 8px; border: 1px solid var(--border); background: var(--surface);
   font-weight: 600; font-size: 0.92rem; color: var(--text); cursor: pointer;
 }}
-.section-tabs {{ display: flex; gap: 4px; margin: 16px 0 20px; border-bottom: 1px solid var(--border); }}
-.section-tabs a {{
-  padding: 10px 16px; text-decoration: none; color: var(--muted); font-weight: 600; font-size: 0.9rem;
-  border-bottom: 2px solid transparent; margin-bottom: -1px;
-}}
-.section-tabs a.active {{ color: var(--accent); border-bottom-color: var(--accent); }}
-.section-tabs a:hover {{ color: var(--text); }}
 .empty-state {{ text-align: center; padding: 60px 20px; color: var(--muted); }}
 </style></head>
-<body>
-{nav}
+<body class="{body_class}">
+{sidebar}
+<div class="{"main-content" if authenticated else ""}">
 {body}
+</div>
 </body></html>"""
 
 
@@ -292,6 +339,7 @@ def _login_page(*, error: bool = False) -> str:
 
 def _manage_page(
     tokens: dict[str, str], *, created: tuple[str, str] | None = None, error: str | None = None,
+    current_agent: str | None = None,
 ) -> str:
     rows = "".join(
         f"<tr><td>{html.escape(group_id)}</td>"
@@ -329,22 +377,12 @@ def _manage_page(
   <thead><tr><th>Agente</th><th></th><th></th></tr></thead>
   <tbody>{rows}</tbody>
   </table>
-</div>""")
-
-
-def _section_tabs(group_id: str, active: str) -> str:
-    tabs = [("graph", "Grafo"), ("vault", "Vault")]
-    links = "".join(
-        f'<a href="/agents/{quote(group_id)}/{slug}" class="{"active" if slug == active else ""}">{label}</a>'
-        for slug, label in tabs
-    )
-    return f'<div class="section-tabs">{links}</div>'
+</div>""", all_agents=sorted(tokens.values()), current_agent=current_agent, view="manage")
 
 
 def _graph_page(group_id: str, all_agents: list[str]) -> str:
     return _layout(f"""
 <h1>{html.escape(group_id)}</h1>
-{_section_tabs(group_id, "graph")}
 <p class="muted">Consultado en vivo desde FalkorDB, acotado al grafo de este agente — nunca al grafo compartido <code>main</code>.</p>
 <div class="card" style="padding:0; overflow:hidden">
   <div id="graph-canvas" style="width:100%; height:600px"></div>
@@ -380,7 +418,7 @@ fetch("/agents/{quote(group_id)}/graph-data")
       '<p class="muted" style="padding:20px">No se pudo cargar el grafo: ' + err + '</p>';
   }});
 </script>
-""", nav_extra=_agent_switcher(all_agents, group_id, "graph"))
+""", all_agents=all_agents, current_agent=group_id, view="graph")
 
 
 async def _vault_request(method: str, group_id: str, token: str, path: str, **kwargs):
@@ -456,7 +494,6 @@ setVaultMode("{default_mode}");
 </script>"""
     return _layout(f"""
 <h1>{html.escape(group_id)}</h1>
-{_section_tabs(group_id, "vault")}
 <div class="split">
   <div>
     <div class="card" style="padding:12px 0">
@@ -474,7 +511,7 @@ setVaultMode("{default_mode}");
   </div>
   <div>{editor or '<div class="card muted">Selecciona una nota de la izquierda, o crea una nueva.</div>'}</div>
 </div>
-""", nav_extra=_agent_switcher(all_agents, group_id, "vault"))
+""", all_agents=all_agents, current_agent=group_id, view="vault")
 
 
 async def handle_login_page(request: web.Request) -> web.Response:

@@ -135,6 +135,17 @@ echo "=== unauthorized token is rejected by the proxy ==="
 CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$PROXY/mcp/" -H "Authorization: Bearer not-a-real-token" -H "Content-Type: application/json" -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}')
 [[ "$CODE" == "401" ]] && pass "invalid token rejected with 401" || fail "invalid token got $CODE, expected 401"
 
+echo "=== per-agent MCP URL (/mcp/<group_id>/): identifies, never alone authorizes ==="
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$PROXY/mcp/e2e_miguel/" \
+  -H "Authorization: Bearer ${TOKEN_MIGUEL}" -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}')
+[[ "$CODE" == "200" ]] && pass "agent's own token on its own /mcp/<id>/ URL succeeds" || fail "own token on own URL got $CODE, expected 200"
+
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$PROXY/mcp/e2e_miguel/" \
+  -H "Authorization: Bearer ${TOKEN_ANA}" -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}')
+[[ "$CODE" == "403" ]] && pass "another agent's token on this /mcp/<id>/ URL is rejected (403)" || fail "wrong-agent token on /mcp/e2e_miguel/ got $CODE, expected 403"
+
 rm -f "$COOKIES"
 echo
 if [[ "$FAIL" == "0" ]]; then

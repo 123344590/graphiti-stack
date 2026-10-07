@@ -38,18 +38,30 @@ configure the Graphiti MCP connection to the proxy, not directly to
 `graphiti-mcp`:
 
 ```
-GRAPHITI_MCP_URL=http://10.147.200.5:8080/mcp/
-GRAPHITI_MCP_TOKEN=<the token shown once in the admin panel>
+GRAPHITI_MCP_URL=http://10.147.200.5:8080/mcp/miguel/
+GRAPHITI_MCP_TOKEN=<the token shown once in the admin panel, for THIS agent>
 ```
+
+The `/mcp/<group_id>/` path segment names which agent the URL is for —
+purely for configuration clarity, so a glance at an agent's `.env` tells you
+whose endpoint it is. It is **not** what authorizes the request: the Bearer
+token is still required and must belong to that same agent, or the proxy
+rejects the request with 403 before it ever reaches Graphiti. A copy-pasted
+URL with the wrong token for it fails closed, it never silently falls back
+to either identity. The bare `/mcp/` path (no agent name) still works
+exactly as before for any caller not yet updated to the per-agent form.
 
 The exact config keys depend on how the agent's MCP client config is wired
 (`tools/mcp_tool.py` in hermes-agent, `streamable_http` transport) — point it
-at the proxy's `/mcp/` path with the Bearer token in the connection's auth
-header. Do **not** point any agent at `graphiti-mcp:8000` directly; that
-bypasses the group_id enforcement entirely.
+at the proxy's `/mcp/<group_id>/` path with that agent's Bearer token in the
+connection's auth header. Do **not** point any agent at `graphiti-mcp:8000`
+directly; that bypasses the group_id enforcement entirely.
 
 Each agent needs its own token (one per `group_id`) — never share a token
-across two Hermes profiles, or they share a graph and a vault.
+across two Hermes profiles, or they share a graph and a vault. Verify it
+below (§4) after wiring any agent, especially the first time: a URL naming
+one agent with another agent's token is exactly the mistake the 403 exists
+to catch.
 
 ## 3. Updating the stack
 
@@ -78,13 +90,25 @@ shows `main` instead, the proxy failed to inject `group_id` — check that the
 tool name reached `_enforce_group_id` and matches one of
 `_SINGULAR_GROUP_TOOLS` / `_LIST_GROUP_TOOLS` in `proxy.py`.
 
+Also confirm the per-agent URL can't be used with the wrong token — this
+should return **403**, not 200 and not a silent fallback to either agent:
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://10.147.200.5:8080/mcp/miguel/ \
+  -H "Authorization: Bearer <B's token>" -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}'
+```
+
 ## 5. Vaults and the in-page graph viewer
 
 Each agent's vault is a plain directory at `./data/vaults/<group_id>/` on the
 host (bind-mounted into `vault-service`), browsable/editable from that
-agent's Vault tab in the admin panel. To seed a vault with existing notes,
-drop `.md` files directly into that directory — the vault service and admin
-panel pick them up on next read, no restart needed.
+agent's Vault item in the admin panel's sidebar. Picking an agent from the
+sidebar's agent switcher scopes both its Grafo and Vault items together —
+there's no separate per-section agent picker to keep in sync. To seed a
+vault with existing notes, drop `.md` files directly into that directory —
+the vault service and admin panel pick them up on next read, no restart
+needed.
 
 The Grafo tab queries FalkorDB directly (the `admin` service talks to
 `falkordb:6379` over the internal docker network) and renders the result
