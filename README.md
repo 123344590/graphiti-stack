@@ -9,9 +9,12 @@ fleet of Hermes agents, with:
   Bearer token and *structurally* forces that agent's `group_id` on every
   `tools/call`, so no agent (by mistake or by trying) can read or write another
   agent's memory. This is enforced server-side, not by prompt instruction.
-- **admin panel**: create/revoke agent tokens, view each agent's graph (embedded
-  FalkorDB Browser, scoped to that agent's own database) and manage its Obsidian
-  vault (list/read/write notes) from one web UI.
+- **admin panel**: one logged-in app with an agent switcher in the nav (same
+  pattern as switching profiles in the sibling `hermes-agent` dashboard) —
+  pick an agent, see its graph (queried directly from FalkorDB, rendered
+  in-page — not a link out to a third-party UI) or its Obsidian vault
+  (list/read/write notes), switching agents never leaves the section you're
+  on. `+ Crear agente` is the one place that creates or revokes tokens.
 - **vault service**: per-agent Obsidian vault directories, exposed read/write
   over the same per-agent Bearer tokens so each Hermes profile's `terminal`/file
   tools (or the bundled `obsidian` skill) can reach only its own vault.

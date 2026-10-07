@@ -67,11 +67,27 @@ parameter a client could even manipulate to name a different vault.
 
 | Service | Role | Exposed? |
 |---|---|---|
-| `falkordb` | Graph storage (one logical graph per `group_id`) + FalkorDB Browser UI | Browser UI only, for the admin panel's embedded graph viewer |
+| `falkordb` | Graph storage (one logical graph per `group_id`) | Its own Browser UI on `FALKORDB_BROWSER_PORT`, for manual/debug use only — the admin panel's graph viewer talks to FalkorDB directly, not through it |
 | `graphiti-mcp` | Official Graphiti MCP server, unmodified | No — only reachable via `auth-proxy` |
 | `auth-proxy` | Token auth + structural group_id/group_ids enforcement | Yes — the only agent-facing port |
 | `vault-service` | Per-agent Obsidian vault over HTTP, same token scheme | No — only reachable via `admin` |
-| `admin` | Operator web UI: create/revoke agent tokens, embedded graph viewer per agent, vault browser/editor per agent | Yes — HTTP Basic |
+| `admin` | Operator web UI: create/revoke agent tokens, in-page graph viewer per agent (queries FalkorDB directly, renders with vis-network), vault browser/editor per agent | Yes — behind its own login page |
+
+### Why the graph viewer queries FalkorDB directly instead of embedding FalkorDB Browser
+
+The first version of the graph viewer linked out to FalkorDB's own Browser UI
+(`FALKORDB_BROWSER_PORT`), passing `?graph=<group_id>` in the URL to try to
+pre-select the right database. Two problems surfaced in real use: FalkorDB
+Browser sends `X-Frame-Options: SAMEORIGIN`, so it can't be embedded in an
+iframe at all (confirmed: the same URL opened directly in a new tab works
+fine, embedded it's refused) — and separately, its own graph switcher turned
+out not to read that `?graph=` parameter, so two different agents' links
+rendered the exact same generic browser session instead of two different
+graphs. Querying FalkorDB directly (`select_graph(group_id).query(...)`,
+same `falkordb` Python client Graphiti itself uses) and rendering the result
+with vis-network sidesteps both problems: the viewer is genuinely part of
+the admin panel's own page (same login session, same layout), and the graph
+it shows is unambiguously the one `group_id` asked for.
 
 ## Known version pins (and why)
 

@@ -84,13 +84,18 @@ services:
     build: ./services/admin
     restart: unless-stopped
     depends_on:
-      - auth-proxy
-      - vault-service
+      falkordb:
+        condition: service_healthy
+      auth-proxy:
+        condition: service_started
+      vault-service:
+        condition: service_started
     environment:
       - ADMIN_USER=${ADMIN_USER}
       - ADMIN_PASSWORD=${ADMIN_PASSWORD}
       - AGENT_TOKENS_PATH=/data/agent_tokens.json
-      - FALKORDB_BROWSER_BASE=http://${PUBLIC_HOST}:${FALKORDB_BROWSER_PORT:-3000}
+      - FALKORDB_HOST=falkordb
+      - FALKORDB_PORT=6379
       - VAULT_SERVICE_BASE=http://vault-service:8070
     volumes:
       - agent_tokens:/data

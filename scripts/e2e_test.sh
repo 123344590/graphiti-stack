@@ -24,8 +24,8 @@ CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/login" -d "username
 [[ "$CODE" == "401" ]] && pass "wrong credentials return 401" || fail "wrong credentials got $CODE, expected 401"
 
 curl -s -X POST "$BASE/login" -d "username=${ADMIN_USER}&password=${ADMIN_PASSWORD}" -c "$COOKIES" -o /dev/null
-CODE=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/" -b "$COOKIES")
-[[ "$CODE" == "200" ]] && pass "correct credentials + cookie -> 200" || fail "authenticated GET / got $CODE, expected 200"
+CODE=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/agents/new" -b "$COOKIES")
+[[ "$CODE" == "200" ]] && pass "correct credentials + cookie -> 200 on /agents/new" || fail "authenticated GET /agents/new got $CODE, expected 200"
 
 # Idempotency: a previous (possibly failed) run of this script may have left
 # e2e_miguel/e2e_ana behind, which would make the "create" calls below hit
@@ -46,10 +46,41 @@ RESP3=$(curl -s -X POST "$BASE/create" -d "group_id=e2e_ana" -b "$COOKIES")
 TOKEN_ANA=$(echo "$RESP3" | extract_token)
 [[ -n "$TOKEN_ANA" ]] && pass "create e2e_ana returns a token" || fail "no token for e2e_ana"
 
-echo "=== graph page has no iframe, has target=_blank link ==="
+echo "=== graph page is rendered in-page (no iframe, no external link-out) ==="
 GRAPH_HTML=$(curl -s "$BASE/agents/e2e_miguel/graph" -b "$COOKIES")
 echo "$GRAPH_HTML" | grep -q '<iframe' && fail "graph page still has an iframe" || pass "graph page has no iframe"
-echo "$GRAPH_HTML" | grep -q 'target="_blank"' && pass "graph page has a new-tab link" || fail "graph page missing target=_blank link"
+echo "$GRAPH_HTML" | grep -q 'graph-data' && pass "graph page fetches its own /graph-data endpoint" || fail "graph page missing graph-data fetch"
+
+echo "=== integrated navigation: root redirect, agent switcher, section tabs ==="
+curl -s -X POST "$BASE/delete" -d "group_id=e2e_miguel" -b "$COOKIES" -o /dev/null
+curl -s -X POST "$BASE/delete" -d "group_id=e2e_ana" -b "$COOKIES" -o /dev/null
+CODE=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/" -b "$COOKIES")
+LOCATION=$(curl -s -o /dev/null -w '%{redirect_url}' "$BASE/" -b "$COOKIES")
+[[ "$CODE" == "302" && "$LOCATION" == *"/agents/new" ]] && pass "with zero agents, GET / redirects to /agents/new" || fail "GET / with zero agents: code=$CODE location=$LOCATION, expected 302 -> /agents/new"
+
+TOKEN_MIGUEL=$(curl -s -X POST "$BASE/create" -d "group_id=e2e_miguel" -b "$COOKIES" | extract_token)
+TOKEN_ANA=$(curl -s -X POST "$BASE/create" -d "group_id=e2e_ana" -b "$COOKIES" | extract_token)
+
+LOCATION=$(curl -s -o /dev/null -w '%{redirect_url}' "$BASE/" -b "$COOKIES")
+[[ "$LOCATION" == *"/graph" ]] && pass "with agents present, GET / redirects straight to a graph page" || fail "GET / with agents present redirected to $LOCATION, expected a /graph page"
+
+SWITCHER=$(curl -s "$BASE/agents/e2e_miguel/vault" -b "$COOKIES" | grep -o "agent-switcher[^>]*onchange=\"[^\"]*\"")
+echo "$SWITCHER" | grep -q "/vault'" && pass "agent switcher on the vault page targets /vault (stays on section when switched)" || fail "agent switcher on vault page doesn't target /vault: $SWITCHER"
+OPTIONS=$(curl -s "$BASE/agents/e2e_miguel/vault" -b "$COOKIES" | grep -o 'value="e2e_[a-z]*"')
+echo "$OPTIONS" | grep -q "e2e_miguel" && echo "$OPTIONS" | grep -q "e2e_ana" && pass "agent switcher lists both agents" || fail "agent switcher missing one of the agents: $OPTIONS"
+
+TABS=$(curl -s "$BASE/agents/e2e_miguel/graph" -b "$COOKIES" | grep -o '<div class="section-tabs">.*</div>')
+echo "$TABS" | grep -q 'Grafo</a>' && echo "$TABS" | grep -q 'Vault</a>' && pass "section tabs (Grafo/Vault) present" || fail "section tabs missing: $TABS"
+
+echo "=== graph-data returns genuinely different graphs per agent (originally reported bug) ==="
+docker compose exec -T falkordb redis-cli GRAPH.QUERY e2e_miguel "CREATE (:Person {name:'E2E Miguel'})-[:TESTS]->(:Thing {name:'Thing A'})" > /dev/null
+docker compose exec -T falkordb redis-cli GRAPH.QUERY e2e_ana "CREATE (:Person {name:'E2E Ana'})-[:TESTS]->(:Thing {name:'Thing B'})" > /dev/null
+MIGUEL_GRAPH=$(curl -s "$BASE/agents/e2e_miguel/graph-data" -b "$COOKIES")
+ANA_GRAPH=$(curl -s "$BASE/agents/e2e_ana/graph-data" -b "$COOKIES")
+echo "$MIGUEL_GRAPH" | grep -q "E2E Miguel" && pass "e2e_miguel's graph-data contains its own node" || fail "e2e_miguel's graph-data missing its node: $MIGUEL_GRAPH"
+echo "$ANA_GRAPH" | grep -q "E2E Ana" && pass "e2e_ana's graph-data contains its own node" || fail "e2e_ana's graph-data missing its node: $ANA_GRAPH"
+[[ "$MIGUEL_GRAPH" != "$ANA_GRAPH" ]] && pass "the two agents' graph-data are genuinely different" || fail "e2e_miguel and e2e_ana returned identical graph-data"
+echo "$MIGUEL_GRAPH" | grep -q "E2E Ana" && fail "e2e_miguel's graph-data leaked e2e_ana's node" || pass "e2e_miguel's graph-data does not contain e2e_ana's node"
 
 echo "=== vault: cross-agent isolation ==="
 docker compose exec -T admin python3 -c "

@@ -10,11 +10,11 @@ the target host, build, `docker compose up`. This one targets `viernes`
 On `viernes`, as the `soporte` user (has sudo + docker group):
 
 ```bash
-git clone git@github.com:Tecnologias-LAN/graphiti-stack.git ~/graphiti-stack
+git clone https://github.com/123344590/graphiti-stack.git ~/graphiti-stack
 cd ~/graphiti-stack
 cp .env.example .env
 nano .env   # fill in LLM_API_KEY, LLM_BASE_URL, LLM_MODEL, EMBEDDING_MODEL,
-            # ADMIN_USER, ADMIN_PASSWORD, PUBLIC_HOST=10.147.200.5
+            # ADMIN_USER, ADMIN_PASSWORD
 ./scripts/bootstrap.sh
 ```
 
@@ -22,9 +22,14 @@ nano .env   # fill in LLM_API_KEY, LLM_BASE_URL, LLM_MODEL, EMBEDDING_MODEL,
 committed — it's `.gitignore`d), builds the `graphiti-mcp` image with the
 pinned `GRAPHITI_CORE_VERSION`, and starts every service.
 
-Open `http://10.147.200.5:8090` (admin panel, HTTP Basic with the
-`ADMIN_USER`/`ADMIN_PASSWORD` from `.env`) and create your first agent — this
-hands you a Bearer token shown exactly once.
+Open `http://10.147.200.5:8090` and log in with `ADMIN_USER`/`ADMIN_PASSWORD`
+from `.env` (an actual login page, not the browser's native auth prompt) —
+with no agents yet, it redirects straight to "crear agente" to create your
+first one, handing you a Bearer token shown exactly once. Once an agent
+exists, the panel always opens on an agent's own page (graph or vault); the
+nav's agent switcher jumps between agents without leaving the section
+you're on, and "+ Crear agente" is the one place that creates or revokes
+tokens.
 
 ## 2. Point a Hermes agent at the stack
 
@@ -73,13 +78,20 @@ shows `main` instead, the proxy failed to inject `group_id` — check that the
 tool name reached `_enforce_group_id` and matches one of
 `_SINGULAR_GROUP_TOOLS` / `_LIST_GROUP_TOOLS` in `proxy.py`.
 
-## 5. Vaults
+## 5. Vaults and the in-page graph viewer
 
 Each agent's vault is a plain directory at `./data/vaults/<group_id>/` on the
-host (bind-mounted into `vault-service`), browsable/editable from the admin
-panel's "ver vault" link per agent. To seed a vault with existing notes,
+host (bind-mounted into `vault-service`), browsable/editable from that
+agent's Vault tab in the admin panel. To seed a vault with existing notes,
 drop `.md` files directly into that directory — the vault service and admin
 panel pick them up on next read, no restart needed.
+
+The Grafo tab queries FalkorDB directly (the `admin` service talks to
+`falkordb:6379` over the internal docker network) and renders the result
+in-page with vis-network — nothing to configure here beyond the stack
+itself being up. `FALKORDB_BROWSER_PORT` (default 3000) still exposes
+FalkorDB's own third-party Browser UI for raw Cypher/manual debugging, but
+the admin panel's own graph view doesn't use it.
 
 ## Secrets
 

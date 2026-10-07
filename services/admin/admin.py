@@ -1,13 +1,21 @@
 #!/usr/bin/env python3
 """Admin panel for the graphiti-stack deployment.
 
-One page to: create/revoke per-agent tokens (shared by the Graphiti auth-proxy
-and the vault service — same token, same group_id, one identity per agent),
-open each agent's knowledge graph (FalkorDB Browser, in a new tab and
-pre-scoped to that agent's own graph key so operators never land on the
-shared default graph by accident — it can't be embedded in an iframe, see
-_graph_page), and browse/edit each agent's Obsidian vault (list notes, read,
-edit, save) via the vault service's HTTP API.
+One integrated, logged-in app: an agent switcher in the nav (same pattern as
+switching profiles in the sibling hermes-agent dashboard) jumps between
+agents while staying on the same section -- Grafo or Vault -- so picking a
+different agent never bounces back to a separate list page. `/agents/new`
+is the one place that creates or revokes agent tokens; everything else
+(`/agents/{group_id}/graph`, `/agents/{group_id}/vault`) is scoped to one
+agent at a time and requires that agent to already exist.
+
+The graph view queries FalkorDB directly over the internal docker network
+and renders in-page with vis-network -- not a link out to FalkorDB's own
+Browser UI, which sends X-Frame-Options and refuses to be embedded, and
+whose own tab-based graph switcher turned out not to read the `?graph=`
+query param an earlier version of this panel relied on to scope it per
+agent (two agents' links rendered the exact same generic browser tab). The
+vault view lists/reads/writes notes via the vault service's HTTP API.
 
 Single operator account, authenticated through an actual login page (not the
 browser's native HTTP-Basic prompt) — a signed, httpOnly session cookie backs
@@ -23,6 +31,7 @@ both read. Every one of those three processes re-reads the file per request
 token created/revoked here takes effect everywhere on the very next request —
 no restart, no signal, no coordination beyond the shared bind-mounted file.
 """
+import asyncio
 import hashlib
 import hmac
 import html
@@ -35,12 +44,65 @@ from urllib.parse import quote
 
 import aiohttp
 from aiohttp import web
+from falkordb import FalkorDB
 
 TOKENS_PATH = Path(os.environ.get("AGENT_TOKENS_PATH", "/data/agent_tokens.json"))
 ADMIN_USER = os.environ["ADMIN_USER"]
 ADMIN_PASSWORD = os.environ["ADMIN_PASSWORD"]
-FALKORDB_BROWSER_BASE = os.environ.get("FALKORDB_BROWSER_BASE", "http://10.147.200.5:3000")
+FALKORDB_HOST = os.environ.get("FALKORDB_HOST", "falkordb")
+FALKORDB_PORT = int(os.environ.get("FALKORDB_PORT", "6379"))
 VAULT_SERVICE_BASE = os.environ.get("VAULT_SERVICE_BASE", "http://vault-service:8070")
+
+# Two separate bounded queries rather than one MATCH (n) OPTIONAL MATCH
+# (n)-[r]->(m) -- the combined form timed out in practice even on a small
+# graph (FalkorDB's planner apparently doesn't bound the optional-match
+# fan-out the way the LIMIT on the outer MATCH suggests it would). Nodes and
+# edges are fetched independently and merged in Python instead; a graph with
+# only unconnected nodes (e.g. one add_memory call that hasn't finished
+# entity-linking yet) still renders those nodes with no edges.
+_NODES_QUERY = "MATCH (n) RETURN n LIMIT $limit"
+_EDGES_QUERY = "MATCH (n)-[r]->(m) RETURN n, r, m LIMIT $limit"
+_GRAPH_NODE_LIMIT = 300
+
+
+def _falkordb_client() -> FalkorDB:
+    return FalkorDB(host=FALKORDB_HOST, port=FALKORDB_PORT)
+
+
+def _node_label(labels: list[str], properties: dict) -> str:
+    for key in ("name", "title", "uuid"):
+        if key in properties and properties[key]:
+            return str(properties[key])[:60]
+    return labels[0] if labels else "Node"
+
+
+def _as_node_id(endpoint) -> int:
+    """FalkorDB's client returns an edge's endpoints as plain ints in some
+    result shapes and as full Node objects in others, depending on whether
+    that node was also independently bound/returned elsewhere in the same
+    query -- handle both rather than assume one."""
+    return endpoint.id if hasattr(endpoint, "id") else endpoint
+
+
+def _add_node(nodes: dict[int, dict], n) -> None:
+    if n is not None and n.id not in nodes:
+        nodes[n.id] = {"id": n.id, "label": _node_label(n.labels, n.properties), "group": (n.labels[0] if n.labels else "Node")}
+
+
+def _fetch_graph_data(group_id: str) -> dict:
+    db = _falkordb_client()
+    graph = db.select_graph(group_id)
+    nodes: dict[int, dict] = {}
+    for (n,) in graph.query(_NODES_QUERY, params={"limit": _GRAPH_NODE_LIMIT}).result_set:
+        _add_node(nodes, n)
+
+    edges: list[dict] = []
+    for n, r, m in graph.query(_EDGES_QUERY, params={"limit": _GRAPH_NODE_LIMIT}).result_set:
+        _add_node(nodes, n)
+        _add_node(nodes, m)
+        if r is not None:
+            edges.append({"from": _as_node_id(r.src_node), "to": _as_node_id(r.dest_node), "label": r.relation})
+    return {"nodes": list(nodes.values()), "edges": edges}
 
 # Generated fresh on every process start -- every existing session cookie is
 # invalidated on a restart/redeploy, which is the simplest correct behavior
@@ -98,8 +160,28 @@ def _token_for(group_id: str, tokens: dict[str, str]) -> str | None:
     return None
 
 
-def _layout(body: str, *, authenticated: bool = True) -> str:
-    nav = '<div class="nav"><a href="/">Agentes</a><a href="/logout">Cerrar sesión</a></div>' if authenticated else ""
+def _agent_switcher(all_agents: list[str], current: str | None, view: str) -> str:
+    """Dropdown that jumps straight to <selected agent>/<same view> -- changing
+    the agent re-renders the same section (graph stays on graph, vault stays
+    on vault) instead of bouncing back to a separate agent list."""
+    if not all_agents:
+        return ""
+    options = "".join(
+        f'<option value="{quote(a)}" {"selected" if a == current else ""}>{html.escape(a)}</option>'
+        for a in all_agents
+    )
+    return f"""<select class="agent-switcher" onchange="location.href='/agents/' + this.value + '/{view}'">
+  <option value="" disabled {"selected" if current is None else ""}>Agente…</option>
+  {options}
+</select>"""
+
+
+def _layout(body: str, *, authenticated: bool = True, nav_extra: str = "") -> str:
+    nav = (
+        f'<div class="nav"><div class="row">'
+        f'<a href="/agents/new">+ Crear agente</a>{nav_extra}'
+        f'</div><a href="/logout">Cerrar sesión</a></div>'
+    ) if authenticated else ""
     return f"""<!DOCTYPE html>
 <html><head><title>Graphiti Admin</title>
 <meta charset="utf-8">
@@ -172,6 +254,18 @@ ul.vault-explorer li a {{
 ul.vault-explorer li a:hover {{ background: var(--bg); }}
 ul.vault-explorer li.active a {{ background: #eef2ff; border-left-color: var(--accent); font-weight: 600; color: var(--accent); }}
 .note-icon {{ font-size: 0.95em; opacity: 0.7; }}
+.agent-switcher {{
+  padding: 8px 12px; border-radius: 8px; border: 1px solid var(--border); background: var(--surface);
+  font-weight: 600; font-size: 0.92rem; color: var(--text); cursor: pointer;
+}}
+.section-tabs {{ display: flex; gap: 4px; margin: 16px 0 20px; border-bottom: 1px solid var(--border); }}
+.section-tabs a {{
+  padding: 10px 16px; text-decoration: none; color: var(--muted); font-weight: 600; font-size: 0.9rem;
+  border-bottom: 2px solid transparent; margin-bottom: -1px;
+}}
+.section-tabs a.active {{ color: var(--accent); border-bottom-color: var(--accent); }}
+.section-tabs a:hover {{ color: var(--text); }}
+.empty-state {{ text-align: center; padding: 60px 20px; color: var(--muted); }}
 </style></head>
 <body>
 {nav}
@@ -196,21 +290,20 @@ def _login_page(*, error: bool = False) -> str:
 """, authenticated=False)
 
 
-def _agents_page(
+def _manage_page(
     tokens: dict[str, str], *, created: tuple[str, str] | None = None, error: str | None = None,
 ) -> str:
     rows = "".join(
         f"<tr><td>{html.escape(group_id)}</td>"
-        f"<td><a class=\"link-btn\" href=\"/agents/{quote(group_id)}/graph\">ver grafo</a></td>"
-        f"<td><a class=\"link-btn\" href=\"/agents/{quote(group_id)}/vault\">ver vault</a></td>"
+        f"<td><a class=\"link-btn\" href=\"/agents/{quote(group_id)}/graph\">abrir →</a></td>"
         f"<td><form method=\"post\" action=\"/delete\" style=\"display:inline\">"
         f"<input type=\"hidden\" name=\"group_id\" value=\"{html.escape(group_id)}\">"
-        f"<button type=\"submit\" class=\"danger\" onclick=\"return confirm('Revocar el token de {html.escape(group_id)}?')\">revocar</button>"
+        f"<button type=\"submit\" class=\"danger\" onclick=\"return confirm('Revocar el token de {html.escape(group_id)}? Esto no borra su grafo ni su vault, solo el acceso.')\">revocar</button>"
         f"</form></td></tr>"
         for group_id in sorted(tokens.values())
     )
     if not rows:
-        rows = '<tr><td colspan="4" class="muted">Sin agentes todavía — crea el primero arriba.</td></tr>'
+        rows = '<tr><td colspan="3" class="muted">Sin agentes todavía — créalo arriba.</td></tr>'
     banner = ""
     if created:
         group_id, token = created
@@ -222,8 +315,8 @@ def _agents_page(
     elif error:
         banner = f'<div class="banner" style="background:#fef2f2;border-color:#fecaca"><b>{html.escape(error)}</b></div>'
     return _layout(f"""
-<h1>Graphiti — Agentes</h1>
-<p class="muted">Cada agente tiene su propio grafo de memoria y su propio vault de Obsidian, aislados estructuralmente.</p>
+<h1>Crear y gestionar agentes</h1>
+<p class="muted">Cada agente tiene su propio grafo de memoria y su propio vault de Obsidian, aislados estructuralmente por token — un agente nunca puede leer ni escribir el grafo o el vault de otro.</p>
 {banner}
 <div class="card">
   <form method="post" action="/create" class="row">
@@ -233,29 +326,61 @@ def _agents_page(
 </div>
 <div class="card">
   <table>
-  <thead><tr><th>Agente</th><th>Grafo</th><th>Vault</th><th></th></tr></thead>
+  <thead><tr><th>Agente</th><th></th><th></th></tr></thead>
   <tbody>{rows}</tbody>
   </table>
 </div>""")
 
 
-def _graph_page(group_id: str) -> str:
-    browser_url = f"{FALKORDB_BROWSER_BASE}/?graph={quote(group_id)}"
+def _section_tabs(group_id: str, active: str) -> str:
+    tabs = [("graph", "Grafo"), ("vault", "Vault")]
+    links = "".join(
+        f'<a href="/agents/{quote(group_id)}/{slug}" class="{"active" if slug == active else ""}">{label}</a>'
+        for slug, label in tabs
+    )
+    return f'<div class="section-tabs">{links}</div>'
+
+
+def _graph_page(group_id: str, all_agents: list[str]) -> str:
     return _layout(f"""
-<h1>Grafo de "{html.escape(group_id)}"</h1>
-<div class="card">
-<p class="muted">FalkorDB Browser no permite ser embebido dentro de otra página
-(bloqueo propio del servidor vía <code>X-Frame-Options</code>, no algo que este
-panel pueda desactivar) — se abre en pestaña nueva, pre-seleccionado en el
-grafo de este agente.</p>
-<p><a class="link-btn" href="{browser_url}" target="_blank" rel="noopener">
-Abrir grafo de "{html.escape(group_id)}" en FalkorDB Browser →</a></p>
-<p class="muted">Si ahí pide conexión manual, host/puerto son los del propio
-FalkorDB en este stack (ver <code>docs/DEPLOY.md</code>) — el <code>graph</code>
-en la URL ya fija la base de datos a <code>{html.escape(group_id)}</code>, no al
-grafo compartido <code>main</code>.</p>
+<h1>{html.escape(group_id)}</h1>
+{_section_tabs(group_id, "graph")}
+<p class="muted">Consultado en vivo desde FalkorDB, acotado al grafo de este agente — nunca al grafo compartido <code>main</code>.</p>
+<div class="card" style="padding:0; overflow:hidden">
+  <div id="graph-canvas" style="width:100%; height:600px"></div>
+  <div id="graph-empty" class="empty-state" style="display:none">
+    Este agente todavía no tiene memoria guardada en su grafo.
+  </div>
 </div>
-""")
+<script src="https://cdnjs.cloudflare.com/ajax/libs/vis-network/9.1.9/standalone/umd/vis-network.min.js"></script>
+<script>
+fetch("/agents/{quote(group_id)}/graph-data")
+  .then(r => r.json())
+  .then(data => {{
+    if (data.nodes.length === 0) {{
+      document.getElementById("graph-canvas").style.display = "none";
+      document.getElementById("graph-empty").style.display = "block";
+      return;
+    }}
+    const container = document.getElementById("graph-canvas");
+    const options = {{
+      nodes: {{ shape: "dot", size: 14, font: {{ size: 13, color: "#1a1d23" }}, borderWidth: 1 }},
+      edges: {{ arrows: "to", font: {{ size: 10, align: "middle" }}, color: {{ color: "#c7cbd3" }}, smooth: {{ type: "continuous" }} }},
+      groups: {{
+        Entity: {{ color: "#4f46e5" }}, Episodic: {{ color: "#15803d" }},
+        Person: {{ color: "#dc2626" }}, Preference: {{ color: "#d97706" }}
+      }},
+      physics: {{ stabilization: {{ iterations: 150 }} }},
+      interaction: {{ hover: true }}
+    }};
+    new vis.Network(container, {{ nodes: new vis.DataSet(data.nodes), edges: new vis.DataSet(data.edges) }}, options);
+  }})
+  .catch(err => {{
+    document.getElementById("graph-canvas").innerHTML =
+      '<p class="muted" style="padding:20px">No se pudo cargar el grafo: ' + err + '</p>';
+  }});
+</script>
+""", nav_extra=_agent_switcher(all_agents, group_id, "graph"))
 
 
 async def _vault_request(method: str, group_id: str, token: str, path: str, **kwargs):
@@ -273,7 +398,10 @@ def _note_display_name(filename: str) -> str:
     return filename[:-3] if filename.endswith(".md") else filename
 
 
-def _vault_page(group_id: str, notes: list[str], *, open_note: str | None, content: str | None, saved: bool) -> str:
+def _vault_page(
+    group_id: str, notes: list[str], *, open_note: str | None, content: str | None, saved: bool,
+    all_agents: list[str],
+) -> str:
     note_items = "".join(
         f"<li class=\"{'active' if n == open_note else ''}\">"
         f"<a href=\"/agents/{quote(group_id)}/vault?note={quote(n)}\">"
@@ -327,7 +455,8 @@ function setVaultMode(mode) {{
 setVaultMode("{default_mode}");
 </script>"""
     return _layout(f"""
-<h1>Vault de "{html.escape(group_id)}"</h1>
+<h1>{html.escape(group_id)}</h1>
+{_section_tabs(group_id, "vault")}
 <div class="split">
   <div>
     <div class="card" style="padding:12px 0">
@@ -345,7 +474,7 @@ setVaultMode("{default_mode}");
   </div>
   <div>{editor or '<div class="card muted">Selecciona una nota de la izquierda, o crea una nueva.</div>'}</div>
 </div>
-""")
+""", nav_extra=_agent_switcher(all_agents, group_id, "vault"))
 
 
 async def handle_login_page(request: web.Request) -> web.Response:
@@ -376,7 +505,15 @@ async def handle_logout(request: web.Request) -> web.Response:
 
 async def handle_index(request: web.Request) -> web.Response:
     _require_auth(request)
-    return web.Response(text=_agents_page(_load()), content_type="text/html")
+    agents = sorted(_load().values())
+    if not agents:
+        raise web.HTTPFound("/agents/new")
+    raise web.HTTPFound(f"/agents/{quote(agents[0])}/graph")
+
+
+async def handle_manage(request: web.Request) -> web.Response:
+    _require_auth(request)
+    return web.Response(text=_manage_page(_load()), content_type="text/html")
 
 
 async def handle_create(request: web.Request) -> web.Response:
@@ -386,19 +523,19 @@ async def handle_create(request: web.Request) -> web.Response:
     if not group_id or not group_id.replace("_", "").replace("-", "").isalnum():
         tokens = _load()
         return web.Response(
-            text=_agents_page(tokens, error="Nombre de agente inválido — usa solo letras, números, guiones y guion bajo."),
+            text=_manage_page(tokens, error="Nombre de agente inválido — usa solo letras, números, guiones y guion bajo."),
             content_type="text/html", status=400,
         )
     tokens = _load()
     if group_id in tokens.values():
         return web.Response(
-            text=_agents_page(tokens, error=f'El agente "{group_id}" ya existe — revócalo primero si quieres un token nuevo.'),
+            text=_manage_page(tokens, error=f'El agente "{group_id}" ya existe — revócalo primero si quieres un token nuevo.'),
             content_type="text/html", status=400,
         )
     new_token = secrets.token_urlsafe(32)
     tokens[new_token] = group_id
     _save(tokens)
-    return web.Response(text=_agents_page(tokens, created=(group_id, new_token)), content_type="text/html")
+    return web.Response(text=_manage_page(tokens, created=(group_id, new_token)), content_type="text/html")
 
 
 async def handle_delete(request: web.Request) -> web.Response:
@@ -408,15 +545,25 @@ async def handle_delete(request: web.Request) -> web.Response:
     tokens = _load()
     tokens = {tok: gid for tok, gid in tokens.items() if gid != group_id}
     _save(tokens)
-    raise web.HTTPFound("/")
+    raise web.HTTPFound("/agents/new")
 
 
 async def handle_graph(request: web.Request) -> web.Response:
     _require_auth(request)
     group_id = request.match_info["group_id"]
+    tokens = _load()
+    if group_id not in tokens.values():
+        raise web.HTTPNotFound(text="unknown agent")
+    return web.Response(text=_graph_page(group_id, sorted(tokens.values())), content_type="text/html")
+
+
+async def handle_graph_data(request: web.Request) -> web.Response:
+    _require_auth(request)
+    group_id = request.match_info["group_id"]
     if group_id not in _load().values():
         raise web.HTTPNotFound(text="unknown agent")
-    return web.Response(text=_graph_page(group_id), content_type="text/html")
+    data = await asyncio.get_event_loop().run_in_executor(None, _fetch_graph_data, group_id)
+    return web.json_response(data)
 
 
 async def handle_vault(request: web.Request) -> web.Response:
@@ -437,7 +584,10 @@ async def handle_vault(request: web.Request) -> web.Response:
         except web.HTTPNotFound:
             content = ""
     return web.Response(
-        text=_vault_page(group_id, notes, open_note=open_note, content=content, saved=False),
+        text=_vault_page(
+            group_id, notes, open_note=open_note, content=content, saved=False,
+            all_agents=sorted(tokens.values()),
+        ),
         content_type="text/html",
     )
 
@@ -464,9 +614,11 @@ def build_app() -> web.Application:
     app.router.add_post("/login", handle_login_submit)
     app.router.add_get("/logout", handle_logout)
     app.router.add_get("/", handle_index)
+    app.router.add_get("/agents/new", handle_manage)
     app.router.add_post("/create", handle_create)
     app.router.add_post("/delete", handle_delete)
     app.router.add_get("/agents/{group_id}/graph", handle_graph)
+    app.router.add_get("/agents/{group_id}/graph-data", handle_graph_data)
     app.router.add_get("/agents/{group_id}/vault", handle_vault)
     app.router.add_post("/agents/{group_id}/vault/save", handle_vault_save)
     return app
