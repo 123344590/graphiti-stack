@@ -11,13 +11,22 @@ place that creates or revokes agent tokens; `/agents/{group_id}/graph` and
 `/agents/{group_id}/vault` are scoped to one agent at a time and require
 that agent to already exist.
 
-The graph view queries FalkorDB directly over the internal docker network
-and renders in-page with vis-network -- not a link out to FalkorDB's own
-Browser UI, which sends X-Frame-Options and refuses to be embedded, and
-whose own tab-based graph switcher turned out not to read the `?graph=`
-query param an earlier version of this panel relied on to scope it per
-agent (two agents' links rendered the exact same generic browser tab). The
-vault view lists/reads/writes notes via the vault service's HTTP API.
+The graph view embeds the official FalkorDB Browser (its own service, see
+docker-compose.yml) in an <iframe>, opened on exactly one agent's graph via
+that app's own "share a link" URL param (`?graph=<group_id>`,
+lib/graphTabs.ts in its source). This went through two wrong earlier
+attempts before landing here: a from-scratch vis-network canvas (a worse
+graph viewer than the real app, built instead of reading the real app's
+source), then a plain link to FalkorDB Browser instead of an iframe (its
+own next.config.js hardcodes X-Frame-Options: DENY with no env override).
+The fix for the first was reading that app's actual source — the
+share-link param and `FALKORDB_HOST`/`FALKORDB_AUTO_CONNECT` (skips its
+login form entirely) are both real, documented, zero-source-change
+features. The fix for the second needed exactly one patch on its side
+(scripts/patch-browser-frame-embed.sh: that DENY becomes a CSP
+frame-ancestors scoped to this panel's own origin — not deleted outright,
+which would let any site embed it). The vault view lists/reads/writes
+notes via the vault service's HTTP API.
 
 Single operator account, authenticated through an actual login page (not the
 browser's native HTTP-Basic prompt) — a signed, httpOnly session cookie backs
@@ -33,7 +42,6 @@ both read. Every one of those three processes re-reads the file per request
 token created/revoked here takes effect everywhere on the very next request —
 no restart, no signal, no coordination beyond the shared bind-mounted file.
 """
-import asyncio
 import hashlib
 import hmac
 import html
@@ -46,65 +54,16 @@ from urllib.parse import quote
 
 import aiohttp
 from aiohttp import web
-from falkordb import FalkorDB
 
 TOKENS_PATH = Path(os.environ.get("AGENT_TOKENS_PATH", "/data/agent_tokens.json"))
 ADMIN_USER = os.environ["ADMIN_USER"]
 ADMIN_PASSWORD = os.environ["ADMIN_PASSWORD"]
-FALKORDB_HOST = os.environ.get("FALKORDB_HOST", "falkordb")
-FALKORDB_PORT = int(os.environ.get("FALKORDB_PORT", "6379"))
 VAULT_SERVICE_BASE = os.environ.get("VAULT_SERVICE_BASE", "http://vault-service:8070")
-
-# Two separate bounded queries rather than one MATCH (n) OPTIONAL MATCH
-# (n)-[r]->(m) -- the combined form timed out in practice even on a small
-# graph (FalkorDB's planner apparently doesn't bound the optional-match
-# fan-out the way the LIMIT on the outer MATCH suggests it would). Nodes and
-# edges are fetched independently and merged in Python instead; a graph with
-# only unconnected nodes (e.g. one add_memory call that hasn't finished
-# entity-linking yet) still renders those nodes with no edges.
-_NODES_QUERY = "MATCH (n) RETURN n LIMIT $limit"
-_EDGES_QUERY = "MATCH (n)-[r]->(m) RETURN n, r, m LIMIT $limit"
-_GRAPH_NODE_LIMIT = 300
-
-
-def _falkordb_client() -> FalkorDB:
-    return FalkorDB(host=FALKORDB_HOST, port=FALKORDB_PORT)
-
-
-def _node_label(labels: list[str], properties: dict) -> str:
-    for key in ("name", "title", "uuid"):
-        if key in properties and properties[key]:
-            return str(properties[key])[:60]
-    return labels[0] if labels else "Node"
-
-
-def _as_node_id(endpoint) -> int:
-    """FalkorDB's client returns an edge's endpoints as plain ints in some
-    result shapes and as full Node objects in others, depending on whether
-    that node was also independently bound/returned elsewhere in the same
-    query -- handle both rather than assume one."""
-    return endpoint.id if hasattr(endpoint, "id") else endpoint
-
-
-def _add_node(nodes: dict[int, dict], n) -> None:
-    if n is not None and n.id not in nodes:
-        nodes[n.id] = {"id": n.id, "label": _node_label(n.labels, n.properties), "group": (n.labels[0] if n.labels else "Node")}
-
-
-def _fetch_graph_data(group_id: str) -> dict:
-    db = _falkordb_client()
-    graph = db.select_graph(group_id)
-    nodes: dict[int, dict] = {}
-    for (n,) in graph.query(_NODES_QUERY, params={"limit": _GRAPH_NODE_LIMIT}).result_set:
-        _add_node(nodes, n)
-
-    edges: list[dict] = []
-    for n, r, m in graph.query(_EDGES_QUERY, params={"limit": _GRAPH_NODE_LIMIT}).result_set:
-        _add_node(nodes, n)
-        _add_node(nodes, m)
-        if r is not None:
-            edges.append({"from": _as_node_id(r.src_node), "to": _as_node_id(r.dest_node), "label": r.relation})
-    return {"nodes": list(nodes.values()), "edges": edges}
+# Reachable from the OPERATOR's browser (not from inside the docker network,
+# unlike every other *_BASE/*_HOST var in this file) -- this builds a link
+# the admin panel hands back to the browser to follow, not a request this
+# process makes itself.
+FALKORDB_BROWSER_BASE = os.environ.get("FALKORDB_BROWSER_BASE", "http://localhost:3002")
 
 # Generated fresh on every process start -- every existing session cookie is
 # invalidated on a restart/redeploy, which is the simplest correct behavior
@@ -381,43 +340,19 @@ def _manage_page(
 
 
 def _graph_page(group_id: str, all_agents: list[str]) -> str:
+    # FalkorDB Browser's own share-link param (lib/graphTabs.ts, parseSharedTab
+    # upstream) -- opens that app directly on this agent's graph, nothing to
+    # patch on its side for this part. FALKORDB_AUTO_CONNECT (set in this
+    # service's own environment in docker-compose.yml) means it never shows
+    # its login form either, so the only thing visibly different per agent is
+    # exactly the graph in view.
+    browser_url = f"{FALKORDB_BROWSER_BASE}/graph?graph={quote(group_id)}"
     return _layout(f"""
 <h1>{html.escape(group_id)}</h1>
-<p class="muted">Consultado en vivo desde FalkorDB, acotado al grafo de este agente — nunca al grafo compartido <code>main</code>.</p>
+<p class="muted">FalkorDB Browser (la app oficial), acotado al grafo de este agente — nunca al grafo compartido <code>main</code>.</p>
 <div class="card" style="padding:0; overflow:hidden">
-  <div id="graph-canvas" style="width:100%; height:600px"></div>
-  <div id="graph-empty" class="empty-state" style="display:none">
-    Este agente todavía no tiene memoria guardada en su grafo.
-  </div>
+  <iframe src="{browser_url}" style="width:100%; height:75vh; border:0; display:block"></iframe>
 </div>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/vis-network/9.1.9/standalone/umd/vis-network.min.js"></script>
-<script>
-fetch("/agents/{quote(group_id)}/graph-data")
-  .then(r => r.json())
-  .then(data => {{
-    if (data.nodes.length === 0) {{
-      document.getElementById("graph-canvas").style.display = "none";
-      document.getElementById("graph-empty").style.display = "block";
-      return;
-    }}
-    const container = document.getElementById("graph-canvas");
-    const options = {{
-      nodes: {{ shape: "dot", size: 14, font: {{ size: 13, color: "#1a1d23" }}, borderWidth: 1 }},
-      edges: {{ arrows: "to", font: {{ size: 10, align: "middle" }}, color: {{ color: "#c7cbd3" }}, smooth: {{ type: "continuous" }} }},
-      groups: {{
-        Entity: {{ color: "#4f46e5" }}, Episodic: {{ color: "#15803d" }},
-        Person: {{ color: "#dc2626" }}, Preference: {{ color: "#d97706" }}
-      }},
-      physics: {{ stabilization: {{ iterations: 150 }} }},
-      interaction: {{ hover: true }}
-    }};
-    new vis.Network(container, {{ nodes: new vis.DataSet(data.nodes), edges: new vis.DataSet(data.edges) }}, options);
-  }})
-  .catch(err => {{
-    document.getElementById("graph-canvas").innerHTML =
-      '<p class="muted" style="padding:20px">No se pudo cargar el grafo: ' + err + '</p>';
-  }});
-</script>
 """, all_agents=all_agents, current_agent=group_id, view="graph")
 
 
@@ -594,15 +529,6 @@ async def handle_graph(request: web.Request) -> web.Response:
     return web.Response(text=_graph_page(group_id, sorted(tokens.values())), content_type="text/html")
 
 
-async def handle_graph_data(request: web.Request) -> web.Response:
-    _require_auth(request)
-    group_id = request.match_info["group_id"]
-    if group_id not in _load().values():
-        raise web.HTTPNotFound(text="unknown agent")
-    data = await asyncio.get_event_loop().run_in_executor(None, _fetch_graph_data, group_id)
-    return web.json_response(data)
-
-
 async def handle_vault(request: web.Request) -> web.Response:
     _require_auth(request)
     group_id = request.match_info["group_id"]
@@ -655,7 +581,6 @@ def build_app() -> web.Application:
     app.router.add_post("/create", handle_create)
     app.router.add_post("/delete", handle_delete)
     app.router.add_get("/agents/{group_id}/graph", handle_graph)
-    app.router.add_get("/agents/{group_id}/graph-data", handle_graph_data)
     app.router.add_get("/agents/{group_id}/vault", handle_vault)
     app.router.add_post("/agents/{group_id}/vault/save", handle_vault_save)
     return app

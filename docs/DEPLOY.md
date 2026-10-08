@@ -1,28 +1,35 @@
 # Deploy runbook
 
 Same pattern as the sibling `hermes-agent` deploy to `manty`: clone/update on
-the target host, build, `docker compose up`. This one targets `viernes`
-(10.147.200.5 on the `Manty_Red` ZeroTier network), which already has Docker
-+ real sudo.
+the target host, build, `docker compose up`. Examples below use `viernes`
+(10.147.200.5 on the `Manty_Red` ZeroTier network) and its `soporte` user,
+but the same steps apply to any Docker host — substitute your own hostname/
+IP and user. (This project has also been deployed this way to `servidor-casa`,
+reusing an existing Ollama container on its own docker network for
+embeddings — see the "reusing an existing service" note in step 2.)
 
 ## 1. First-time deploy
 
-On `viernes`, as the `soporte` user (has sudo + docker group):
+As a user with Docker access on the target host:
 
 ```bash
 git clone https://github.com/123344590/graphiti-stack.git ~/graphiti-stack
 cd ~/graphiti-stack
 cp .env.example .env
 nano .env   # fill in LLM_API_KEY, LLM_BASE_URL, LLM_MODEL, EMBEDDING_MODEL,
-            # ADMIN_USER, ADMIN_PASSWORD
+            # ADMIN_USER, ADMIN_PASSWORD, PUBLIC_HOST (this host's IP/hostname
+            # reachable by whoever opens the admin panel in a browser)
 ./scripts/bootstrap.sh
 ```
 
-`bootstrap.sh` clones the upstream Graphiti repo into `repo/` (vendored, not
-committed — it's `.gitignore`d), builds the `graphiti-mcp` image with the
-pinned `GRAPHITI_CORE_VERSION`, and starts every service.
+`bootstrap.sh` clones the upstream Graphiti repo into `repo/` and FalkorDB
+Browser into `repo-browser/` (both vendored, not committed — `.gitignore`d),
+applies the one source patch FalkorDB Browser needs
+(`scripts/patch-browser-frame-embed.sh`), builds the `graphiti-mcp` image
+with the pinned `GRAPHITI_CORE_VERSION`, and starts every service.
 
-Open `http://10.147.200.5:8090` and log in with `ADMIN_USER`/`ADMIN_PASSWORD`
+Open `http://<PUBLIC_HOST>:8090` (e.g. `http://10.147.200.5:8090` for
+`viernes`) and log in with `ADMIN_USER`/`ADMIN_PASSWORD`
 from `.env` (an actual login page, not the browser's native auth prompt) —
 with no agents yet, it redirects straight to "crear agente" to create your
 first one, handing you a Bearer token shown exactly once. Once an agent
@@ -110,12 +117,17 @@ vault with existing notes, drop `.md` files directly into that directory —
 the vault service and admin panel pick them up on next read, no restart
 needed.
 
-The Grafo tab queries FalkorDB directly (the `admin` service talks to
-`falkordb:6379` over the internal docker network) and renders the result
-in-page with vis-network — nothing to configure here beyond the stack
-itself being up. `FALKORDB_BROWSER_PORT` (default 3000) still exposes
-FalkorDB's own third-party Browser UI for raw Cypher/manual debugging, but
-the admin panel's own graph view doesn't use it.
+The Grafo tab embeds the official FalkorDB Browser (service
+`falkordb-browser`, `FALKORDB_BROWSER_PORT`, default 3002) in an iframe,
+pre-scoped to that agent's own graph via its own `?graph=<name>` share-link
+feature. It auto-connects to the stack's `falkordb` service and never shows
+its own login form (`FALKORDB_AUTO_CONNECT=true`). Its source is patched
+in exactly one place by `scripts/patch-browser-frame-embed.sh` (part of
+`bootstrap.sh`) to allow that embedding — upstream otherwise refuses to be
+framed at all. Browsing directly to `http://<host>:${FALKORDB_BROWSER_PORT}`
+works (it's the same app, unauthenticated by its own login thanks to
+auto-connect) but shows whatever graph it last had open, not scoped to one
+agent — always go through the admin panel's Grafo page instead.
 
 ## Secrets
 

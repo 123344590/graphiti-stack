@@ -67,27 +67,37 @@ parameter a client could even manipulate to name a different vault.
 
 | Service | Role | Exposed? |
 |---|---|---|
-| `falkordb` | Graph storage (one logical graph per `group_id`) | Its own Browser UI on `FALKORDB_BROWSER_PORT`, for manual/debug use only — the admin panel's graph viewer talks to FalkorDB directly, not through it |
+| `falkordb` | Graph storage (one logical graph per `group_id`) | No host port — only `falkordb-browser` and `graphiti-mcp` reach it, over the docker network |
+| `falkordb-browser` | Official FalkorDB Browser, vendored with one source patch (see below) | Yes, but not meant to be browsed to directly — the admin panel embeds its `/graph?graph=<id>` page in an iframe |
 | `graphiti-mcp` | Official Graphiti MCP server, unmodified | No — only reachable via `auth-proxy` |
 | `auth-proxy` | Token auth + structural group_id/group_ids enforcement | Yes — the only agent-facing port |
 | `vault-service` | Per-agent Obsidian vault over HTTP, same token scheme | No — only reachable via `admin` |
-| `admin` | Operator web UI: create/revoke agent tokens, in-page graph viewer per agent (queries FalkorDB directly, renders with vis-network), vault browser/editor per agent | Yes — behind its own login page |
+| `admin` | Operator web UI: create/revoke agent tokens, embedded per-agent graph view, vault browser/editor per agent | Yes — behind its own login page |
 
-### Why the graph viewer queries FalkorDB directly instead of embedding FalkorDB Browser
+### Why the graph viewer embeds FalkorDB Browser instead of reimplementing one
 
-The first version of the graph viewer linked out to FalkorDB's own Browser UI
-(`FALKORDB_BROWSER_PORT`), passing `?graph=<group_id>` in the URL to try to
-pre-select the right database. Two problems surfaced in real use: FalkorDB
-Browser sends `X-Frame-Options: SAMEORIGIN`, so it can't be embedded in an
-iframe at all (confirmed: the same URL opened directly in a new tab works
-fine, embedded it's refused) — and separately, its own graph switcher turned
-out not to read that `?graph=` parameter, so two different agents' links
-rendered the exact same generic browser session instead of two different
-graphs. Querying FalkorDB directly (`select_graph(group_id).query(...)`,
-same `falkordb` Python client Graphiti itself uses) and rendering the result
-with vis-network sidesteps both problems: the viewer is genuinely part of
-the admin panel's own page (same login session, same layout), and the graph
-it shows is unambiguously the one `group_id` asked for.
+Two wrong attempts preceded this. The first reimplemented a graph canvas
+from scratch with vis-network, querying FalkorDB directly — a worse viewer
+than the official app, built without first reading that app's own source.
+The second tried linking out to FalkorDB Browser passing `?graph=<group_id>`
+in the URL, assuming it would pre-select the database; that version of
+FalkorDB Browser's graph switcher didn't read the parameter, so two
+different agents' links rendered the exact same generic browser session.
+
+Reading FalkorDB Browser's actual current source (not assuming from a
+previous, stale check) settled both questions: its "share a link" feature
+really does read `?graph=<name>` off the URL (`lib/graphTabs.ts`,
+`parseSharedTab`) and opens directly on that graph — no patch needed for
+that part. Auto-connecting to our `falkordb` service without its login form
+is also a real, documented, env-var-only feature
+(`lib/preconfiguredConnection.ts`: `FALKORDB_HOST`/`FALKORDB_PORT`/
+`FALKORDB_AUTO_CONNECT`). The one real obstacle was that its
+`next.config.js` hardcodes `X-Frame-Options: DENY` with no env override, so
+embedding it in the admin panel's own page needed exactly one source patch
+(`scripts/patch-browser-frame-embed.sh`, applied by `bootstrap.sh` after
+every clone/update): that header becomes a `Content-Security-Policy:
+frame-ancestors` scoped to the admin panel's own origin — narrower than
+deleting the header, which would let any site embed it.
 
 ## Known version pins (and why)
 
@@ -104,7 +114,9 @@ it shows is unambiguously the one `group_id` asked for.
 ## What this does NOT do
 
 - It does not fork or patch Graphiti or FalkorDB — both run unmodified
-  upstream builds/images, version-pinned only.
+  upstream builds/images, version-pinned only. FalkorDB Browser is the one
+  exception, and deliberately a narrow one: a single line in its
+  `next.config.js` (see above), applied by a script, not a maintained fork.
 - It does not replace the bundled Hermes `obsidian` skill (filesystem-first,
   reads `OBSIDIAN_VAULT_PATH` locally) — it's a separate, optional way to
   reach the *same shape* of vault (a directory of `.md` files) remotely, for

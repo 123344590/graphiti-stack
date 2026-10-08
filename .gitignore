@@ -1,5 +1,6 @@
 .env
 repo/
+repo-browser/
 data/vaults/*
 !data/vaults/.gitkeep
 __pycache__/

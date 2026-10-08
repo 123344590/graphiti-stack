@@ -6,8 +6,9 @@ services:
     # upstream graphiti-core has migrated its index-creation calls for v6.
     image: falkordb/falkordb:v4.22.0
     restart: unless-stopped
-    ports:
-      - "${FALKORDB_BROWSER_PORT:-3000}:3000"
+    # No host port here -- falkordb-browser below is the one UI onto this
+    # database, reached through the admin panel; nothing else needs a direct
+    # connection to FalkorDB from outside the docker network.
     volumes:
       - falkordb_data:/data
     healthcheck:
@@ -15,6 +16,41 @@ services:
       interval: 10s
       timeout: 5s
       retries: 10
+
+  # Official FalkorDB Browser (cloned to ./repo-browser by
+  # scripts/bootstrap.sh) -- this is the real app's own graph visualization,
+  # not a reimplementation. One source line is patched (see
+  # scripts/patch-browser-frame-embed.sh: upstream's hardcoded
+  # X-Frame-Options: DENY -> a CSP frame-ancestors scoped to the admin
+  # panel's own origin, so the admin panel can embed this app's graph page
+  # in an <iframe>). Everything else uses existing, documented features
+  # with zero source changes:
+  #   - FALKORDB_HOST/PORT + FALKORDB_AUTO_CONNECT=true (lib/
+  #     preconfiguredConnection.ts) skip its login form entirely and connect
+  #     straight to our falkordb service -- the operator never sees or types
+  #     a connection.
+  #   - its own "share a link" feature reads ?graph=<name> off the URL
+  #     (lib/graphTabs.ts: parseSharedTab) to open directly on one graph.
+  #     The admin panel's embedded iframe src is exactly such a URL --
+  #     http://<host>:${FALKORDB_BROWSER_PORT}/graph?graph=<group_id>.
+  falkordb-browser:
+    build:
+      context: ./repo-browser
+    restart: unless-stopped
+    depends_on:
+      falkordb:
+        condition: service_healthy
+    environment:
+      - FALKORDB_HOST=falkordb
+      - FALKORDB_PORT=6379
+      - FALKORDB_AUTO_CONNECT=true
+      # Auth.js (NextAuth v5) derives trustHost from AUTH_URL -- the
+      # Dockerfile already sets AUTH_TRUST_HOST=true, this supplies the URL
+      # it trusts. Must match how the admin panel's links reach this
+      # service (same host, this port).
+      - AUTH_URL=http://${PUBLIC_HOST:-localhost}:${FALKORDB_BROWSER_PORT:-3002}
+    ports:
+      - "${FALKORDB_BROWSER_PORT:-3002}:3000"
 
   graphiti-mcp:
     build:
@@ -106,19 +142,21 @@ services:
     build: ./services/admin
     restart: unless-stopped
     depends_on:
-      falkordb:
-        condition: service_healthy
       auth-proxy:
         condition: service_started
       vault-service:
+        condition: service_started
+      falkordb-browser:
         condition: service_started
     environment:
       - ADMIN_USER=${ADMIN_USER}
       - ADMIN_PASSWORD=${ADMIN_PASSWORD}
       - AGENT_TOKENS_PATH=/data/agent_tokens.json
-      - FALKORDB_HOST=falkordb
-      - FALKORDB_PORT=6379
       - VAULT_SERVICE_BASE=http://vault-service:8070
+      # Reachable from the OPERATOR's own browser, not from inside the
+      # docker network -- this becomes an <iframe src> the admin panel
+      # hands back to the browser, same as PUBLIC_HOST everywhere else.
+      - FALKORDB_BROWSER_BASE=http://${PUBLIC_HOST:-localhost}:${FALKORDB_BROWSER_PORT:-3002}
     volumes:
       - agent_tokens:/data
     ports:
