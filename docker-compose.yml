@@ -80,6 +80,28 @@ services:
     expose:
       - "8070"
 
+  # Per-agent Obsidian vault as a REAL MCP server (read_file/write_file/
+  # list_directory/... tools), for a Hermes profile's mcp_servers.obsidian
+  # entry -- distinct from vault-service above, which is a REST API for the
+  # admin panel's own browser/editor UI, not something a Hermes agent calls
+  # as an MCP tool. See services/vault-mcp/supervisor.py for why these are
+  # two different services rather than one: @modelcontextprotocol/server-
+  # filesystem's root directory is fixed at process launch, so giving two
+  # agents two different roots needs one child process each, confined by
+  # the OS to its own directory -- not just application-level filtering.
+  vault-mcp:
+    build: ./services/vault-mcp
+    restart: unless-stopped
+    environment:
+      - VAULTS_ROOT=/data/vaults
+      - AGENT_TOKENS_PATH=/data/tokens/agent_tokens.json
+      - VAULT_MCP_PORT=8080
+    volumes:
+      - agent_tokens:/data/tokens:ro
+      - ./data/vaults:/data/vaults
+    expose:
+      - "8080"
+
   admin:
     build: ./services/admin
     restart: unless-stopped
