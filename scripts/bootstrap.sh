@@ -24,12 +24,20 @@ set +a
 export ADMIN_PUBLIC_ORIGIN="http://${PUBLIC_HOST:-localhost}:${ADMIN_PORT:-8090}"
 
 _clone_or_update() {
+  # Reads the remote's OWN default branch rather than assuming "main" --
+  # falkordb-browser's default is "staging", not "main" (confirmed live: a
+  # hardcoded `git checkout main` here failed with "pathspec 'main' did not
+  # match any file(s)" on a real --depth 1 clone of it). `git clone` without
+  # -b already followed the remote's default correctly; the bug was only in
+  # the UPDATE path re-deriving that same branch by name instead of asking.
   local repo="$1" dir="$2" label="$3"
   if [[ -d "${dir}/.git" ]]; then
     echo "==> Updating existing ${label} checkout in ${dir}"
-    git -C "${dir}" fetch origin main
-    git -C "${dir}" checkout main
-    git -C "${dir}" reset --hard origin/main
+    local default_branch
+    default_branch="$(git -C "${dir}" remote show origin | sed -n 's/.*HEAD branch: //p')"
+    git -C "${dir}" fetch origin "${default_branch}"
+    git -C "${dir}" checkout "${default_branch}"
+    git -C "${dir}" reset --hard "origin/${default_branch}"
   else
     echo "==> Cloning ${label} into ${dir}"
     git clone --depth 1 "${repo}" "${dir}"
