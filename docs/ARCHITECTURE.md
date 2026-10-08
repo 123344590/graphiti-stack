@@ -91,13 +91,22 @@ really does read `?graph=<name>` off the URL (`lib/graphTabs.ts`,
 that part. Auto-connecting to our `falkordb` service without its login form
 is also a real, documented, env-var-only feature
 (`lib/preconfiguredConnection.ts`: `FALKORDB_HOST`/`FALKORDB_PORT`/
-`FALKORDB_AUTO_CONNECT`). The one real obstacle was that its
-`next.config.js` hardcodes `X-Frame-Options: DENY` with no env override, so
-embedding it in the admin panel's own page needed exactly one source patch
-(`scripts/patch-browser-frame-embed.sh`, applied by `bootstrap.sh` after
-every clone/update): that header becomes a `Content-Security-Policy:
-frame-ancestors` scoped to the admin panel's own origin — narrower than
-deleting the header, which would let any site embed it.
+`FALKORDB_AUTO_CONNECT`). The one real obstacle was that it refuses to be
+framed: `next.config.js` declares a static `X-Frame-Options: DENY` header,
+but that one never reaches the browser — `proxy.ts`, a per-request
+middleware, sets its own `Content-Security-Policy` header (with a nonce for
+inline scripts) on every non-API response, including a hardcoded
+`frame-ancestors 'none'`, and that header is what Next.js actually sends.
+(The first version of this patch touched only `next.config.js` and shipped
+without live-testing the running app; `curl -I` against it afterwards still
+showed `frame-ancestors 'none'` in the response — the real lesson being to
+verify a patch against the running server, not just against the file it
+edits.) `scripts/patch-browser-frame-embed.sh` (applied by `bootstrap.sh`
+after every clone/update) patches `proxy.ts` instead: the hardcoded `'none'`
+becomes a call to a small helper reading `CSP_FRAME_ANCESTORS`, mirroring
+the exact pattern the file already uses for its `CSP_CONNECT_SRC` env var —
+scoped to the admin panel's own origin, narrower than deleting the
+directive outright, which would let any site embed it.
 
 ## Known version pins (and why)
 
@@ -115,8 +124,9 @@ deleting the header, which would let any site embed it.
 
 - It does not fork or patch Graphiti or FalkorDB — both run unmodified
   upstream builds/images, version-pinned only. FalkorDB Browser is the one
-  exception, and deliberately a narrow one: a single line in its
-  `next.config.js` (see above), applied by a script, not a maintained fork.
+  exception, and deliberately a narrow one: a single directive in its
+  `proxy.ts` middleware (see above), applied by a script, not a maintained
+  fork.
 - It does not replace the bundled Hermes `obsidian` skill (filesystem-first,
   reads `OBSIDIAN_VAULT_PATH` locally) — it's a separate, optional way to
   reach the *same shape* of vault (a directory of `.md` files) remotely, for

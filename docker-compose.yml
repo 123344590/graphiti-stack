@@ -19,12 +19,16 @@ services:
 
   # Official FalkorDB Browser (cloned to ./repo-browser by
   # scripts/bootstrap.sh) -- this is the real app's own graph visualization,
-  # not a reimplementation. One source line is patched (see
-  # scripts/patch-browser-frame-embed.sh: upstream's hardcoded
-  # X-Frame-Options: DENY -> a CSP frame-ancestors scoped to the admin
-  # panel's own origin, so the admin panel can embed this app's graph page
-  # in an <iframe>). Everything else uses existing, documented features
-  # with zero source changes:
+  # not a reimplementation. One file is patched (see
+  # scripts/patch-browser-frame-embed.sh): proxy.ts's per-request middleware
+  # hardcodes `frame-ancestors 'none'` on its own CSP header -- this is what
+  # the browser actually receives (next.config.js ALSO declares a static
+  # X-Frame-Options: DENY, but that header never reaches the client; the
+  # middleware's header wins). The patch makes that directive read
+  # CSP_FRAME_ANCESTORS (set below), scoped to the admin panel's own origin,
+  # so the admin panel can embed this app's graph page in an <iframe>.
+  # Everything else uses existing, documented features with zero source
+  # changes:
   #   - FALKORDB_HOST/PORT + FALKORDB_AUTO_CONNECT=true (lib/
   #     preconfiguredConnection.ts) skip its login form entirely and connect
   #     straight to our falkordb service -- the operator never sees or types
@@ -49,6 +53,11 @@ services:
       # it trusts. Must match how the admin panel's links reach this
       # service (same host, this port).
       - AUTH_URL=http://${PUBLIC_HOST:-localhost}:${FALKORDB_BROWSER_PORT:-3002}
+      # Read by the patched proxy.ts (scripts/patch-browser-frame-embed.sh) --
+      # the ONE origin allowed to embed this app in an <iframe>. Must be the
+      # admin panel's own origin, same value as ADMIN_PUBLIC_ORIGIN used when
+      # applying that patch.
+      - CSP_FRAME_ANCESTORS=http://${PUBLIC_HOST:-localhost}:${ADMIN_PORT:-8090}
     ports:
       - "${FALKORDB_BROWSER_PORT:-3002}:3000"
 
